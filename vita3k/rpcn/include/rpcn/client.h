@@ -72,6 +72,8 @@ public:
 
     // Blocking. Connects (TLS + protocol check) and logs in if not already done.
     State connect_and_login();
+    // Connects without logging in (state Connected on success), for the account commands that need no login
+    State connect_only();
     void disconnect();
 
     State state() const { return current_state.load(); }

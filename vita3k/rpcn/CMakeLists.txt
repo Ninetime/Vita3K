@@ -1,11 +1,13 @@
 add_library(
     rpcn
     STATIC
+    include/rpcn/account.h
     include/rpcn/client.h
     include/rpcn/p2p.h
     include/rpcn/vport.h
     include/rpcn/stream.h
     include/rpcn/types.h
+    src/account.cpp
     src/client.cpp
     src/p2p.cpp
     src/vport.cpp

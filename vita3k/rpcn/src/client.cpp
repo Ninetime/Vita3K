@@ -112,6 +112,14 @@ State Client::connect_and_login() {
     return current_state;
 }
 
+State Client::connect_only() {
+    std::lock_guard lock(connect_mutex);
+    close_connection();
+    if (!open_connection())
+        close_connection();
+    return current_state;
+}
+
 void Client::disconnect() {
     std::lock_guard lock(connect_mutex);
     if (current_state == State::Authenticated) {

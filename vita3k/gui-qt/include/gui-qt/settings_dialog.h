@@ -29,6 +29,7 @@
 
 struct EmuEnvState;
 class GuiSettings;
+class RpcnSettingsWidget;
 class SettingsDialogTooltips;
 class ThemeManager;
 
@@ -131,4 +132,5 @@ private:
     std::vector<config::RestartRequiredSetting> m_deferred_restart_settings;
     std::unique_ptr<Ui::vita3k_settings_dialog> m_ui;
     QString m_current_stylesheet;
+    RpcnSettingsWidget *m_rpcn = nullptr;
 };

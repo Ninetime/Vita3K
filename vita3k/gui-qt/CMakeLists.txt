@@ -24,6 +24,7 @@ add_library(gui-qt STATIC
     src/pkg_install_dialog.cpp
     src/physical_key_qt.cpp
     src/qt_utils.cpp
+    src/rpcn_settings_widget.cpp
     src/settings_dialog.cpp
     src/settings_dialog_tooltips.cpp
     src/theme_manager.cpp
@@ -72,6 +73,7 @@ add_library(gui-qt STATIC
     include/gui-qt/pkg_install_dialog.h
     include/gui-qt/physical_key_qt.h
     include/gui-qt/qt_utils.h
+    include/gui-qt/rpcn_settings_widget.h
     include/gui-qt/settings_dialog.h
     include/gui-qt/settings_dialog_tooltips.h
     include/gui-qt/theme_manager.h
@@ -117,6 +119,7 @@ target_link_libraries(gui-qt PUBLIC
     packages
     patch
     renderer
+    rpcn
     touch
     gxm
     audio

@@ -27,6 +27,7 @@
 #include <gui-qt/gui_language.h>
 #include <gui-qt/gui_settings.h>
 #include <gui-qt/qt_utils.h>
+#include <gui-qt/rpcn_settings_widget.h>
 #include <gui-qt/settings_dialog.h>
 #include <gui-qt/settings_dialog_tooltips.h>
 #include <gui-qt/theme_manager.h>
@@ -138,6 +139,9 @@ SettingsDialog::SettingsDialog(EmuEnvState &emuenv,
     m_button_boxes = { m_ui->button_box_main };
     apply_text_overrides();
 
+    m_rpcn = new RpcnSettingsWidget(m_ui->network_scroll_contents);
+    m_ui->network_tab_content_layout->insertWidget(m_ui->network_tab_content_layout->indexOf(m_ui->gb_network_connection_section) + 1, m_rpcn);
+
     if (!m_app_path.empty()) {
         QString title_name = QString::fromStdString(m_app_path);
         for (const auto &app : emuenv.app.apps_list.apps) {
@@ -191,6 +195,7 @@ SettingsDialog::SettingsDialog(EmuEnvState &emuenv,
 
         m_ui->gb_network_http_section->setVisible(false);
         m_ui->gb_adhoc->setVisible(false);
+        m_rpcn->setVisible(false);
     }
 
     const int selected_tab = first_visible_category(m_ui->settingsCategory, m_initial_tab);
@@ -533,6 +538,7 @@ void SettingsDialog::load_config() {
     m_ui->http_read_end_sleep->setValue(emuenv.cfg.http_read_end_sleep_ms);
     update_http_retry_labels();
     populate_adhoc_list();
+    m_rpcn->load(emuenv.cfg);
 
     m_ui->show_welcome->setChecked(emuenv.cfg.show_welcome);
     m_ui->warn_missing_firmware->setChecked(emuenv.cfg.warn_missing_firmware);
@@ -698,6 +704,7 @@ void SettingsDialog::build_desired_config(Config &desired) const {
     desired.http_read_end_attempts = m_ui->http_read_end_attempts->value();
     desired.http_read_end_sleep_ms = m_ui->http_read_end_sleep->value();
     desired.adhoc_addr = m_ui->adhoc_address_box->currentIndex();
+    m_rpcn->save(desired);
     desired.show_welcome = m_ui->show_welcome->isChecked();
     desired.warn_missing_firmware = m_ui->warn_missing_firmware->isChecked();
     desired.user_lang = m_ui->ui_language_box->currentData().toString().toStdString();
@@ -1463,6 +1470,7 @@ void SettingsDialog::setup_dirty_tracking() {
         connect(slider, &QSlider::valueChanged, this, [this] { mark_dirty(); });
     for (auto *list : findChildren<QListWidget *>())
         connect(list, &QListWidget::itemChanged, this, [this] { mark_dirty(); });
+    connect(m_rpcn, &RpcnSettingsWidget::changed, this, [this] { mark_dirty(); });
 }
 
 void SettingsDialog::update_gpu_visibility() {
