@@ -25,6 +25,7 @@
 #include <util/log.h>
 
 #include <np/functions.h>
+#include <rpcn/client.h>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceNpManager);
@@ -45,6 +46,31 @@ enum SceNpManagerErrorCode : uint32_t {
     SCE_NP_MANAGER_ERROR_INVALID_STATE = 0x80550506,
     SCE_NP_MANAGER_ERROR_ID_NOT_AVAIL = 0x80550509
 };
+
+static bool rpcn_enabled(EmuEnvState &emuenv) {
+    return emuenv.cfg.rpcn_enable;
+}
+
+static SceNpServiceState get_service_state(EmuEnvState &emuenv) {
+    if (rpcn_enabled(emuenv))
+        return (emuenv.np.rpcn && emuenv.np.rpcn->is_authenticated()) ? SCE_NP_SERVICE_STATE_ONLINE : SCE_NP_SERVICE_STATE_SIGNED_OUT;
+    return emuenv.cfg.current_config.psn_signed_in ? SCE_NP_SERVICE_STATE_SIGNED_IN : SCE_NP_SERVICE_STATE_SIGNED_OUT;
+}
+
+static void rpcn_connect(EmuEnvState &emuenv) {
+    if (!emuenv.np.rpcn) {
+        rpcn::Config config;
+        config.host = emuenv.cfg.rpcn_host;
+        config.npid = emuenv.cfg.rpcn_npid;
+        config.password = emuenv.cfg.rpcn_password;
+        config.token = emuenv.cfg.rpcn_token;
+        emuenv.np.rpcn = std::make_shared<rpcn::Client>(std::move(config));
+    }
+
+    const rpcn::State result = emuenv.np.rpcn->connect_and_login();
+    if (result != rpcn::State::Authenticated)
+        LOG_ERROR("RPCN: unable to sign in: {}", rpcn::to_string(result));
+}
 
 EXPORT(int, sceNpAuthAbortOAuthRequest) {
     TRACY_FUNC(sceNpAuthAbortOAuthRequest);
@@ -70,9 +96,14 @@ EXPORT(int, sceNpCheckCallback) {
     TRACY_FUNC(sceNpCheckCallback);
 
     const ThreadStateRef thread = emuenv.kernel.get_thread(thread_id);
-    const SceNpServiceState state = emuenv.cfg.current_config.psn_signed_in ? SCE_NP_SERVICE_STATE_SIGNED_IN : SCE_NP_SERVICE_STATE_SIGNED_OUT;
-    for (auto &[_, np_callback] : emuenv.np.cbs) {
-        thread->call_guest(np_callback.pc, { static_cast<uint32_t>(state), 0, np_callback.data });
+    const SceNpServiceState state = get_service_state(emuenv);
+    // Offline mode keeps the historical behaviour of reporting on every check.
+    // With RPCN, report transitions only, as the real library does.
+    if (!rpcn_enabled(emuenv) || state != emuenv.np.last_reported_state) {
+        emuenv.np.last_reported_state = state;
+        for (auto &[_, np_callback] : emuenv.np.cbs) {
+            thread->call_guest(np_callback.pc, { static_cast<uint32_t>(state), 0, np_callback.data });
+        }
     }
 
     auto &auth = emuenv.np.auth_state;
@@ -105,7 +136,7 @@ EXPORT(int, sceNpCheckCallback) {
 
 EXPORT(int, sceNpGetServiceState, SceNpServiceState *state) {
     TRACY_FUNC(sceNpGetServiceState, state);
-    *state = emuenv.cfg.current_config.psn_signed_in ? SCE_NP_SERVICE_STATE_SIGNED_IN : SCE_NP_SERVICE_STATE_SIGNED_OUT;
+    *state = get_service_state(emuenv);
 
     return STUBBED("Stub");
 }
@@ -121,6 +152,13 @@ EXPORT(int, sceNpInit, np::CommunicationConfig *comm_config, void *dontcare) {
     if (!init(emuenv.np, comm_id)) {
         return SCE_NP_ERROR_NOT_INITIALIZED;
     }
+
+    if (comm_id)
+        LOG_INFO("sceNpInit: communication id {}", std::string_view(comm_id->data, strnlen(comm_id->data, sizeof(comm_id->data))));
+
+    emuenv.np.last_reported_state = SCE_NP_SERVICE_STATE_UNKNOWN;
+    if (rpcn_enabled(emuenv))
+        rpcn_connect(emuenv);
 
     return 0;
 }
@@ -150,13 +188,16 @@ EXPORT(int, sceNpManagerGetContentRatingFlag, SceInt *isRestricted, SceInt *age)
 
 EXPORT(int, sceNpManagerGetNpId, np::SceNpId *id) {
     TRACY_FUNC(sceNpManagerGetNpId, id);
-    if (emuenv.io.user_name.length() > SCE_NP_ONLINEID_MAX_LENGTH) {
+    const std::string &online_id = rpcn_enabled(emuenv) ? emuenv.cfg.rpcn_npid : emuenv.io.user_name;
+    if (rpcn_enabled(emuenv) && !(emuenv.np.rpcn && emuenv.np.rpcn->is_authenticated()))
+        return SCE_NP_MANAGER_ERROR_INVALID_STATE; // signed out
+    if (online_id.length() > SCE_NP_ONLINEID_MAX_LENGTH) {
         LOG_ERROR("Your online ID has over 16 characters, try again with shorter name");
         return SCE_NP_MANAGER_ERROR_ID_NOT_AVAIL;
     }
     // Fill the unused stuffs to 0 (prevent some weird things happen)
     memset(id, 0, sizeof(np::SceNpId));
-    strcpy(id->handle.data, emuenv.io.user_name.c_str());
+    strcpy(id->handle.data, online_id.c_str());
     id->isIdValid = true;
     id->opt.platformType[0] = 'p';
     id->opt.platformType[1] = 's';

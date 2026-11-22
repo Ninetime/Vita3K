@@ -23,10 +23,15 @@
 #include <mem/util.h> // Address.
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
+
+namespace rpcn {
+class Client;
+}
 
 struct SceNpServiceStateCallback {
     Address pc;
@@ -106,4 +111,9 @@ struct NpState {
     NpTusState tus_state;
     NpAuthState auth_state;
     np::CommunicationID comm_id;
+
+    // RPCN connection, created on first sceNpInit when RPCN is enabled. Kept across
+    // sceNpTerm/sceNpInit so the server never sees a quick logout/login.
+    std::shared_ptr<rpcn::Client> rpcn;
+    SceNpServiceState last_reported_state = SCE_NP_SERVICE_STATE_UNKNOWN;
 };

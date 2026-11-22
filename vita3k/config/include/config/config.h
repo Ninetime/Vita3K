@@ -204,6 +204,11 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(uint64_t, "current-ime-lang", 4, current_ime_lang)                                             \
     code(int, "psn-signed-in", false, psn_signed_in)                                                    \
     code(bool, "http-enable", true, http_enable)                                                        \
+    code(bool, "rpcn-enable", false, rpcn_enable)                                                       \
+    code(std::string, "rpcn-host", std::string{}, rpcn_host)                                            \
+    code(std::string, "rpcn-npid", std::string{}, rpcn_npid)                                            \
+    code(std::string, "rpcn-password", std::string{}, rpcn_password)                                    \
+    code(std::string, "rpcn-token", std::string{}, rpcn_token)                                          \
     code(int, "http-timeout-attempts", 50, http_timeout_attempts)                                       \
     code(int, "http-timeout-sleep-ms", 100, http_timeout_sleep_ms)                                      \
     code(int, "http-read-end-attempts", 10, http_read_end_attempts)                                     \
