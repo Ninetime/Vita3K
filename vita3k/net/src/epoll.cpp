@@ -17,6 +17,8 @@
 
 #include <net/epoll.h>
 
+#include <algorithm>
+#include <chrono>
 #include <optional>
 
 int Epoll::add(int id, std::weak_ptr<Socket> sock, SceNetEpollEvent *ev) {
@@ -52,7 +54,59 @@ static void add_event_fd_set(fd_set *set, int *maxFd, abs_socket sock) {
         *maxFd = sock;
 }
 
+// Checks the sockets that have no host descriptor (RPCN P2P sockets)
+static int poll_virtual(const std::map<int, EpollSocket> &entries, std::map<int, unsigned int> &ready) {
+    int count = 0;
+    for (const auto &[id, entry] : entries) {
+        const auto sock = entry.sock.lock();
+        if (!sock)
+            continue;
+        const int events = sock->poll_events();
+        if (events < 0)
+            continue;
+        count++;
+        const unsigned int pending = static_cast<unsigned int>(events) & (entry.events | SCE_NET_EPOLLERR);
+        if (pending)
+            ready[id] |= pending;
+    }
+    return count;
+}
+
 int Epoll::wait(SceNetEpollEvent *events, int maxevents, int timeout_microseconds) {
+    std::map<int, unsigned int> ready;
+    const bool has_virtual = poll_virtual(eventEntries, ready) > 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(std::max(timeout_microseconds, 0));
+
+    while (true) {
+        int slice = timeout_microseconds;
+        if (has_virtual) {
+            // Poll the P2P sockets every millisecond while waiting on the host ones
+            const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - std::chrono::steady_clock::now()).count();
+            slice = ready.empty() ? static_cast<int>(std::clamp<long long>(timeout_microseconds < 0 ? 1000 : left, 0, 1000)) : 0;
+        }
+        const int ret = wait_host(ready, slice);
+        if (ret < 0)
+            return ret;
+        if (has_virtual)
+            poll_virtual(eventEntries, ready);
+        if (!ready.empty() || !has_virtual)
+            break;
+        if (timeout_microseconds >= 0 && std::chrono::steady_clock::now() >= deadline)
+            break;
+    }
+
+    int eventCount = 0;
+    for (const auto &[id, eventTypes] : ready) {
+        if (eventCount >= maxevents)
+            break;
+        events[eventCount].events = eventTypes;
+        events[eventCount].data = eventEntries.at(id).data;
+        eventCount++;
+    }
+    return eventCount;
+}
+
+int Epoll::wait_host(std::map<int, unsigned int> &ready, int timeout_microseconds) {
     fd_set readFds, writeFds, exceptFds;
     FD_ZERO(&readFds);
     FD_ZERO(&writeFds);
@@ -94,7 +148,6 @@ int Epoll::wait(SceNetEpollEvent *events, int maxevents, int timeout_microsecond
     if (ret < 0)
         return PosixSocket::translate_return_value(ret);
 
-    int eventCount = 0;
     for (const auto &[id, entry] : eventEntries) {
         unsigned int eventTypes = 0;
         const auto sock = get_valid_posix_socket(entry.sock, id);
@@ -108,13 +161,9 @@ int Epoll::wait(SceNetEpollEvent *events, int maxevents, int timeout_microsecond
         if (FD_ISSET(*sock, &exceptFds))
             eventTypes |= SCE_NET_EPOLLERR;
 
-        if (eventTypes != 0 && eventCount < maxevents) {
-            auto i = eventCount++;
-
-            events[i].events = eventTypes;
-            events[i].data = entry.data;
-        }
+        if (eventTypes != 0)
+            ready[id] |= eventTypes;
     }
 
-    return eventCount;
+    return 0;
 }

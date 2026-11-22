@@ -21,6 +21,10 @@
 
 #include <np/common.h>
 #include <np/state.h>
+#include <rpcn/client.h>
+#include <rpcn/pb.h>
+
+#include <thread>
 
 // Handles are simulated. TSS reads fail explicitly without PSN storage or a network worker.
 enum SceNpCommunityServerErrorCode : uint32_t {
@@ -154,19 +158,185 @@ int get_tss_small_storage(NpTusState &tus, const char *export_name, SceInt32 req
     return async ? 0 : RET_ERROR(SCE_NP_COMMUNITY_ERROR_NO_RESOURCE);
 }
 
-int get_async_result(NpTusState &tus, const char *export_name, SceInt32 requestId, SceInt32 *result) {
-    std::lock_guard lock(tus.access_mutex);
-    if (!tus.inited)
-        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+// Returns 1 while the request is still running (poll only)
+int get_async_result(NpTusState &tus, const char *export_name, SceInt32 requestId, SceInt32 *result, bool wait = false) {
+    while (true) {
+        {
+            std::lock_guard lock(tus.access_mutex);
+            if (!tus.inited)
+                return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
 
-    const auto *request = get_request(tus, requestId);
-    if (!request)
-        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INVALID_ID);
-    if (!result || !request->result)
-        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+            const auto *request = get_request(tus, requestId);
+            if (!request)
+                return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INVALID_ID);
+            if (!result)
+                return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INVALID_ARGUMENT);
+            if (request->result) {
+                *result = *request->result;
+                return 0;
+            }
+            if (!wait)
+                return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
 
-    *result = *request->result;
+// ---- TUS over RPCN -----------------------------------------------------------------------
+
+namespace pb = rpcn::pb;
+
+constexpr uint32_t SCE_NP_TUS_DATA_INFO_MAX_SIZE = 384;
+
+enum : uint32_t {
+    SCE_NP_COMMUNITY_SERVER_ERROR_USER_STORAGE_DATA_NOT_FOUND = 0x8055084a,
+    SCE_NP_COMMUNITY_SERVER_ERROR_CONDITIONS_NOT_SATISFIED = 0x80550873,
+};
+
+struct SceNpTusDataInfo {
+    SceSize infoSize;
+    SceUChar8 pad[4];
+    SceUChar8 data[SCE_NP_TUS_DATA_INFO_MAX_SIZE];
+};
+
+struct SceNpTusDataStatus {
+    np::SceNpId ownerId;
+    SceInt32 hasData;
+    SceUInt64 lastChangedDate;
+    np::SceNpId lastChangedAuthorId;
+    Ptr<void> data;
+    SceSize dataSize;
+    SceNpTusDataInfo info;
+};
+// sceNpTusGetDataAsync rejects any other dataStatusSize
+static_assert(sizeof(SceNpTusDataStatus) == 0x1E8);
+
+std::string npid_string(const np::SceNpId *id) {
+    return id ? std::string(id->handle.data, strnlen(id->handle.data, sizeof(id->handle.data))) : std::string{};
+}
+
+void string_to_npid(const std::string &str, np::SceNpId &id) {
+    np::fill_server_npid(id, str);
+}
+
+pb::Writer tus_user(const np::SceNpId *target) {
+    pb::Writer u;
+    u.boolean(1, false);
+    u.string(2, npid_string(target));
+    return u;
+}
+
+std::shared_ptr<rpcn::Client> tus_client(EmuEnvState &emuenv) {
+    auto client = emuenv.np.rpcn;
+    return client && client->is_authenticated() ? client : nullptr;
+}
+
+// Server error byte -> result; nullopt when the request succeeded
+std::optional<SceInt32> tus_error(const std::vector<uint8_t> &reply) {
+    if (reply.empty())
+        return static_cast<SceInt32>(SCE_NP_COMMUNITY_SERVER_ERROR_INTERNAL_SERVER_ERROR);
+    switch (static_cast<rpcn::ErrorType>(reply[0])) {
+    case rpcn::ErrorType::NoError: return std::nullopt;
+    case rpcn::ErrorType::NotFound: return static_cast<SceInt32>(SCE_NP_COMMUNITY_SERVER_ERROR_USER_NOT_ASSIGNED);
+    case rpcn::ErrorType::Unauthorized: return static_cast<SceInt32>(SCE_NP_COMMUNITY_SERVER_ERROR_FORBIDDEN);
+    case rpcn::ErrorType::CondFail: return static_cast<SceInt32>(SCE_NP_COMMUNITY_SERVER_ERROR_CONDITIONS_NOT_SATISFIED);
+    default: return static_cast<SceInt32>(SCE_NP_COMMUNITY_SERVER_ERROR_INTERNAL_SERVER_ERROR);
+    }
+}
+
+// Protobuf after the error byte ("u32 length + message")
+std::optional<pb::Reader> tus_reply_message(const std::vector<uint8_t> &reply, std::vector<uint8_t> &storage) {
+    if (reply.size() < 5)
+        return std::nullopt;
+    uint32_t len;
+    memcpy(&len, reply.data() + 1, 4);
+    if (5 + static_cast<size_t>(len) > reply.size())
+        return std::nullopt;
+    storage.assign(reply.begin() + 5, reply.begin() + 5 + len);
+    pb::Reader r(storage);
+    return r.ok() ? std::optional<pb::Reader>(r) : std::nullopt;
+}
+
+void fill_data_status(SceNpTusDataStatus &out, const pb::Reader &in) {
+    memset(&out, 0, sizeof(out));
+    string_to_npid(in.string(1), out.ownerId);
+    if (!in.boolean(2))
+        return;
+    out.hasData = 1;
+    out.lastChangedDate = in.u64(3);
+    string_to_npid(in.string(4), out.lastChangedAuthorId);
+    const auto info = in.bytes(5);
+    out.info.infoSize = static_cast<SceSize>(std::min<size_t>(info.size(), SCE_NP_TUS_DATA_INFO_MAX_SIZE));
+    memcpy(out.info.data, info.data(), out.info.infoSize);
+}
+
+// Runs under tus.access_mutex once the reply arrives; returns the request result
+using TusReplyHandler = std::function<SceInt32(const std::vector<uint8_t> &reply)>;
+
+int tus_send(EmuEnvState &emuenv, const char *export_name, SceInt32 requestId, rpcn::CommandType command, const pb::Writer &msg, TusReplyHandler handler) {
+    auto &tus = emuenv.np.tus_state;
+    std::string com_id;
+    {
+        std::lock_guard lock(tus.access_mutex);
+        if (!tus.inited)
+            return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
+        auto *request = get_request(tus, requestId);
+        if (!request)
+            return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INVALID_ID);
+        if (request->result)
+            return RET_ERROR(SCE_NP_COMMUNITY_ERROR_TRANSACTION_ALREADY_END);
+        com_id = tus.title_contexts[request->title_context_id];
+    }
+    const auto client = tus_client(emuenv);
+    if (!client)
+        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NO_LOGIN);
+
+    std::vector<uint8_t> payload(rpcn::COMMUNICATION_ID_SIZE, 0);
+    memcpy(payload.data(), com_id.data(), std::min<size_t>(com_id.size(), rpcn::COMMUNICATION_ID_SIZE));
+    const uint32_t len = static_cast<uint32_t>(msg.data().size());
+    payload.insert(payload.end(), reinterpret_cast<const uint8_t *>(&len), reinterpret_cast<const uint8_t *>(&len) + 4);
+    payload.insert(payload.end(), msg.data().begin(), msg.data().end());
+
+    client->request_async(command, payload, [&tus, requestId, handler = std::move(handler), name = std::string(export_name), com_id](rpcn::CommandType, std::vector<uint8_t> reply) {
+        std::lock_guard lock(tus.access_mutex);
+        auto *request = get_request(tus, requestId);
+        if (!request || request->result)
+            return; // deleted or aborted meanwhile
+        const auto error = tus_error(reply);
+        request->result = error ? *error : handler(reply);
+        LOG_INFO("NP TUS: {} ({}) finished with {}", name, com_id, log_hex(static_cast<uint32_t>(*request->result)));
+    });
     return 0;
+}
+
+int tus_get_data(EmuEnvState &emuenv, const char *export_name, SceInt32 requestId, const np::SceNpId *targetNpId, SceInt32 slotId,
+    SceNpTusDataStatus *dataStatus, SceSize dataStatusSize, void *data, SceSize recvSize) {
+    if (!targetNpId || !dataStatus)
+        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (dataStatusSize != sizeof(SceNpTusDataStatus))
+        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INVALID_ALIGNMENT);
+    LOG_INFO("NP TUS: GetData {} slot {} (recv {})", npid_string(targetNpId), slotId, recvSize);
+
+    pb::Writer w;
+    w.message(1, tus_user(targetNpId));
+    w.i32(2, slotId);
+    const Address data_addr = data ? static_cast<Address>(static_cast<uint8_t *>(data) - emuenv.mem.memory.get()) : 0;
+    return tus_send(emuenv, export_name, requestId, rpcn::CommandType::TusGetData, w, [dataStatus, data, data_addr, recvSize](const std::vector<uint8_t> &reply) -> SceInt32 {
+        std::vector<uint8_t> storage;
+        const auto msg = tus_reply_message(reply, storage);
+        if (!msg)
+            return static_cast<SceInt32>(SCE_NP_COMMUNITY_ERROR_BAD_RESPONSE);
+        fill_data_status(*dataStatus, msg->message(1));
+        if (!dataStatus->hasData)
+            return static_cast<SceInt32>(SCE_NP_COMMUNITY_SERVER_ERROR_USER_STORAGE_DATA_NOT_FOUND);
+        const auto bytes = msg->bytes(2);
+        dataStatus->data = Ptr<void>(data_addr);
+        dataStatus->dataSize = static_cast<SceSize>(bytes.size());
+        const size_t to_copy = std::min<size_t>(bytes.size(), data ? recvSize : 0);
+        if (to_copy)
+            memcpy(data, bytes.data(), to_copy);
+        return static_cast<SceInt32>(to_copy);
+    });
 }
 
 EXPORT(int, sceNpTssGetData, SceInt32 requestId, SceInt32 slotId, np::SceNpTssDataStatus *dataStatus,
@@ -278,7 +448,11 @@ EXPORT(int, sceNpTusCreateTitleCtx, const np::CommunicationID *communicationId,
     if (titleCtxId <= 0)
         return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NO_RESOURCE);
 
-    if (!tus.title_contexts.try_emplace(titleCtxId, true).second)
+    std::string com_id;
+    if (communicationId)
+        com_id = fmt::format("{}_{:02}", std::string(communicationId->data, strnlen(communicationId->data, 9)), communicationId->num);
+    LOG_INFO("NP TUS: title context {} for {}", titleCtxId, com_id);
+    if (!tus.title_contexts.try_emplace(titleCtxId, com_id).second)
         return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NO_RESOURCE);
 
     STUBBED("Simulated title context, communication credentials and user defaults are not resolved");
@@ -357,9 +531,9 @@ EXPORT(int, sceNpTusGetData) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpTusGetDataAsync) {
-    STUBBED("TUS operation is unavailable, no asynchronous request is started");
-    return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NO_RESOURCE);
+EXPORT(int, sceNpTusGetDataAsync, SceInt32 requestId, const np::SceNpId *targetNpId, SceInt32 slotId, SceNpTusDataStatus *dataStatus,
+    SceSize dataStatusSize, void *data, SceSize recvSize, const void *option) {
+    return tus_get_data(emuenv, export_name, requestId, targetNpId, slotId, dataStatus, dataStatusSize, data, recvSize);
 }
 
 EXPORT(int, sceNpTusGetDataVUser) {
@@ -429,9 +603,30 @@ EXPORT(int, sceNpTusGetMultiUserDataStatus) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpTusGetMultiUserDataStatusAsync) {
-    STUBBED("TUS operation is unavailable, no asynchronous request is started");
-    return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NO_RESOURCE);
+EXPORT(int, sceNpTusGetMultiUserDataStatusAsync, SceInt32 requestId, const np::SceNpId *targetNpIdArray, SceInt32 slotId,
+    SceNpTusDataStatus *statusArray, SceSize statusArraySize, SceInt32 arrayNum, const void *option) {
+    if (!targetNpIdArray || !statusArray || arrayNum <= 0)
+        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (statusArraySize != sizeof(SceNpTusDataStatus) * arrayNum)
+        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INVALID_ALIGNMENT);
+    LOG_INFO("NP TUS: GetMultiUserDataStatus slot {} for {} user(s)", slotId, arrayNum);
+
+    pb::Writer w;
+    for (SceInt32 i = 0; i < arrayNum; i++)
+        w.message(1, tus_user(&targetNpIdArray[i]));
+    w.i32(2, slotId);
+    return tus_send(emuenv, export_name, requestId, rpcn::CommandType::TusGetMultiUserDataStatus, w, [statusArray, arrayNum](const std::vector<uint8_t> &reply) -> SceInt32 {
+        std::vector<uint8_t> storage;
+        const auto msg = tus_reply_message(reply, storage);
+        if (!msg)
+            return static_cast<SceInt32>(SCE_NP_COMMUNITY_ERROR_BAD_RESPONSE);
+        const auto statuses = msg->messages(1);
+        memset(statusArray, 0, sizeof(SceNpTusDataStatus) * arrayNum);
+        const size_t count = std::min<size_t>(statuses.size(), arrayNum);
+        for (size_t i = 0; i < count; i++)
+            fill_data_status(statusArray[i], statuses[i]);
+        return static_cast<SceInt32>(count);
+    });
 }
 
 EXPORT(int, sceNpTusGetMultiUserDataStatusVUser) {
@@ -484,9 +679,25 @@ EXPORT(int, sceNpTusSetData) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpTusSetDataAsync) {
-    STUBBED("TUS operation is unavailable, no asynchronous request is started");
-    return RET_ERROR(SCE_NP_COMMUNITY_ERROR_NO_RESOURCE);
+EXPORT(int, sceNpTusSetDataAsync, SceInt32 requestId, const np::SceNpId *targetNpId, SceInt32 slotId, SceSize totalSize, SceSize sendSize,
+    const void *data, const SceNpTusDataInfo *info, SceSize infoStructSize, const SceUInt64 *isLastChangedDate, const np::SceNpId *isLastChangedAuthorId, const void *option) {
+    if (!targetNpId || !data)
+        return RET_ERROR(SCE_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT);
+    if (sendSize != totalSize)
+        LOG_WARN("NP TUS: SetData in several parts is not supported ({} of {} bytes)", sendSize, totalSize);
+    LOG_INFO("NP TUS: SetData {} slot {} ({} bytes, info {})", npid_string(targetNpId), slotId, sendSize, info ? info->infoSize : 0);
+
+    pb::Writer w;
+    w.message(1, tus_user(targetNpId));
+    w.i32(2, slotId);
+    w.bytes(3, data, sendSize);
+    if (info)
+        w.bytes(4, info->data, std::min<SceSize>(info->infoSize, SCE_NP_TUS_DATA_INFO_MAX_SIZE));
+    if (isLastChangedDate)
+        w.u64_always(5, *isLastChangedDate);
+    if (isLastChangedAuthorId)
+        w.string(6, npid_string(isLastChangedAuthorId));
+    return tus_send(emuenv, export_name, requestId, rpcn::CommandType::TusSetData, w, [](const std::vector<uint8_t> &) -> SceInt32 { return 0; });
 }
 
 EXPORT(int, sceNpTusSetDataVUser) {
@@ -551,5 +762,5 @@ EXPORT(int, sceNpTusTryAndSetVariableVUserAsync) {
 }
 
 EXPORT(int, sceNpTusWaitAsync, SceInt32 requestId, SceInt32 *result) {
-    return get_async_result(emuenv.np.tus_state, export_name, requestId, result);
+    return get_async_result(emuenv.np.tus_state, export_name, requestId, result, true);
 }

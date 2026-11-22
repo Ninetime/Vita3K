@@ -84,8 +84,12 @@ public:
     // Sends a request; the callback runs on the network thread when the reply arrives.
     bool request_async(CommandType command, const std::vector<uint8_t> &payload, ReplyCallback callback);
 
-    // Drains server notifications (room events, messages, ...) received so far.
+    // Drains server notifications (room events, ...) received so far. MessageReceived
+    // notifications are kept apart, see take_messages().
     std::vector<Notification> take_notifications();
+
+    // Drains MessageReceived notifications (NP Basic messages) received so far.
+    std::vector<Notification> take_messages();
 
     // Simple commands
     std::optional<std::vector<uint16_t>> get_server_list(const std::string &com_id);
@@ -98,6 +102,7 @@ public:
     int64_t user_id() const { return user_uid; }
     std::vector<FriendInfo> friends() const;
     uint32_t local_ipv4() const { return local_addr.load(); } // network byte order
+    uint32_t server_ipv4() const { return server_addr.load(); } // network byte order
 
 private:
     struct Pending {
@@ -125,6 +130,7 @@ private:
     std::thread net_thread;
     std::atomic<bool> stop_thread{ false };
     std::atomic<uint32_t> local_addr{ 0 };
+    std::atomic<uint32_t> server_addr{ 0 };
 
     // Protocol handshake
     std::atomic<bool> server_info_received{ false };
@@ -144,6 +150,7 @@ private:
 
     std::mutex notif_mutex;
     std::vector<Notification> notifications;
+    std::vector<Notification> messages;
 
     // Account
     std::string user_online_name;

@@ -32,6 +32,7 @@
 #endif
 
 #include <condition_variable>
+#include <cstdio>
 #include <mutex>
 
 namespace net_utils {
@@ -420,8 +421,10 @@ std::vector<AssignedAddr> get_all_assigned_addrs() {
         while (pAdapter) {
             IP_ADDR_STRING *pIPAddr = &pAdapter->IpAddressList;
             while (pIPAddr) {
-                if (noAddress.compare(pIPAddr->IpAddress.String) != 0)
-                    out_addrs.push_back({ pAdapter->Description, pIPAddr->IpAddress.String, pIPAddr->IpMask.String });
+                if (noAddress.compare(pIPAddr->IpAddress.String) != 0) {
+                    const std::string gateway = pAdapter->GatewayList.IpAddress.String;
+                    out_addrs.push_back({ pAdapter->Description, pIPAddr->IpAddress.String, pIPAddr->IpMask.String, gateway == noAddress ? std::string{} : gateway });
+                }
                 pIPAddr = pIPAddr->Next;
             }
             pAdapter = pAdapter->Next;
@@ -455,6 +458,27 @@ std::vector<AssignedAddr> get_all_assigned_addrs() {
     }
     if (ifAddrStruct != nullptr)
         freeifaddrs(ifAddrStruct);
+
+#ifdef __linux__
+    // Default routes: "Iface Destination Gateway ..." with addresses in hex, network byte order
+    if (FILE *routes = fopen("/proc/net/route", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), routes)) {
+            char iface[64];
+            unsigned int destination, gateway;
+            if (sscanf(line, "%63s %x %x", iface, &destination, &gateway) != 3 || destination != 0 || gateway == 0)
+                continue;
+            char gateway_str[INET_ADDRSTRLEN];
+            in_addr gateway_addr{};
+            gateway_addr.s_addr = gateway;
+            inet_ntop(AF_INET, &gateway_addr, gateway_str, INET_ADDRSTRLEN);
+            for (auto &addr : out_addrs)
+                if (addr.name == iface && addr.gateway.empty())
+                    addr.gateway = gateway_str;
+        }
+        fclose(routes);
+    }
+#endif
 #endif
     return ret_addrs();
 }

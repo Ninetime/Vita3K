@@ -15,6 +15,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <fmt/ranges.h>
 #include <module/module.h>
 
 #include <io/state.h>
@@ -118,9 +119,8 @@ EXPORT(int, sceNpCmpNpId, np::SceNpId *npid1, np::SceNpId *npid2) {
     if (std::memcmp(npid1->opt.unknown, npid2->opt.unknown, 4) != 0)
         return SCE_NP_UTIL_ERROR_NOT_MATCH;
 
-    if (npid1->opt.platformType[0] == 0 && npid2->opt.platformType[0] == 0)
-        return SCE_NP_UTIL_Ok;
-    if (std::memcmp(&npid1->opt.platformType, &npid2->opt.platformType, 4) != 0)
+    // As in the firmware (np_common): an ID without a platform matches the same ID with any platform
+    if (std::memcmp(npid1->opt.platformType, npid2->opt.platformType, 4) != 0 && npid1->opt.platformType[0] != 0 && npid2->opt.platformType[0] != 0)
         return SCE_NP_UTIL_ERROR_NOT_MATCH;
 
     return SCE_NP_UTIL_Ok;
@@ -131,9 +131,15 @@ EXPORT(int, sceNpCmpNpIdInOrder) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpCmpOnlineId) {
-    TRACY_FUNC(sceNpCmpOnlineId);
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpCmpOnlineId, const np::SceNpOnlineId *id1, const np::SceNpOnlineId *id2) {
+    TRACY_FUNC(sceNpCmpOnlineId, id1, id2);
+
+    if (id1 == nullptr || id2 == nullptr)
+        return SCE_NP_UTIL_ERROR_INVALID_ARGUMENT;
+    if (std::strncmp(id1->data, id2->data, SCE_NP_ONLINEID_MAX_LENGTH) != 0)
+        return SCE_NP_UTIL_ERROR_NOT_MATCH;
+
+    return SCE_NP_UTIL_Ok;
 }
 
 EXPORT(int, sceNpCommonBase64Encode) {
@@ -161,9 +167,28 @@ EXPORT(int, sceNpCommonMallocNpServerName) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpGetPlatformType) {
-    TRACY_FUNC(sceNpGetPlatformType);
-    return UNIMPLEMENTED();
+// Platform stored in SceNpId.opt, values as in the PS3 sceNpUtilGetPlatformType
+enum SceNpPlatformType : int {
+    SCE_NP_PLATFORM_TYPE_NONE = 0,
+    SCE_NP_PLATFORM_TYPE_PS3 = 1,
+    SCE_NP_PLATFORM_TYPE_PSP2 = 2,
+    SCE_NP_PLATFORM_TYPE_PS4 = 3,
+};
+
+EXPORT(int, sceNpGetPlatformType, const np::SceNpId *npid) {
+    TRACY_FUNC(sceNpGetPlatformType, npid);
+    if (!npid)
+        return RET_ERROR(SCE_NP_UTIL_ERROR_INVALID_ARGUMENT);
+    const char *type = npid->opt.platformType;
+    if (memcmp(type, "psp2", 4) == 0)
+        return SCE_NP_PLATFORM_TYPE_PSP2;
+    if (memcmp(type, "ps3\0", 4) == 0)
+        return SCE_NP_PLATFORM_TYPE_PS3;
+    if (memcmp(type, "ps4\0", 4) == 0)
+        return SCE_NP_PLATFORM_TYPE_PS4;
+    if (memcmp(type, "\0\0\0\0", 4) != 0)
+        LOG_WARN("sceNpGetPlatformType: unknown platform {:02X}", fmt::join(type, type + 4, " "));
+    return SCE_NP_PLATFORM_TYPE_NONE;
 }
 
 EXPORT(int, sceNpSetPlatformType) {

@@ -500,6 +500,11 @@ void shutdown_app_runtime(EmuEnvState &state) {
 
     ngs::deinit(state.ngs, state.mem);
 
+    // NP modules (Matching2, Basic) keep state outside the app: reset it
+    for (const auto &hook : state.np.app_stop_hooks)
+        hook();
+    state.np.app_stop_hooks.clear();
+
     // trophy (maybe namespace this?)
     deinit(state.np);
 

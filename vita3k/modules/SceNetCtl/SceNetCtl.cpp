@@ -25,6 +25,8 @@
 #include <kernel/state.h>
 #include <net/state.h>
 #include <net/types.h>
+#include <np/state.h>
+#include <rpcn/p2p.h>
 #include <packages/sfo.h>
 #include <rtc/rtc.h>
 #include <util/lock_and_find.h>
@@ -542,7 +544,22 @@ EXPORT(int, sceNetCtlGetNatInfo, SceNetCtlNatInfo *natinfo) {
         return RET_ERROR(SCE_NET_CTL_ERROR_INVALID_ADDR);
     }
 
-    return UNIMPLEMENTED();
+    // Values from the SDK: stun status 0 unchecked / 1 failed / 2 ok, NAT types 1 to 3
+    constexpr int STUN_OK = 2;
+    constexpr int STUN_UNCHECKED = 0;
+    constexpr int NAT_TYPE_2 = 2;
+    const auto p2p = emuenv.np.p2p;
+    if (p2p && p2p->ok() && p2p->public_addr()) {
+        // RPCN told us our public address, as a STUN check would
+        natinfo->stun_status = STUN_OK;
+        natinfo->nat_type = NAT_TYPE_2;
+        natinfo->mapped_addr.s_addr = p2p->public_addr();
+    } else {
+        natinfo->stun_status = STUN_UNCHECKED;
+        natinfo->nat_type = 0;
+        natinfo->mapped_addr.s_addr = 0;
+    }
+    return 0;
 }
 
 EXPORT(int, sceNetCtlGetPhoneMaxDownloadableSize, SceInt64 *maxDownloadableSize) {
@@ -599,6 +616,11 @@ EXPORT(int, sceNetCtlInetGetInfo, int code, SceNetCtlInfo *info) {
         std::strncpy(info->netmask, addr.netMask.c_str(), sizeof(info->netmask) - 1);
         info->netmask[sizeof(info->netmask) - 1] = '\0';
         break;
+    case SCE_NETCTL_INFO_GET_DEFAULT_ROUTE:
+        // Games ping it to measure the connection quality (e.g. SFxT's QoS)
+        std::strncpy(info->default_route, addr.gateway.c_str(), sizeof(info->default_route) - 1);
+        info->default_route[sizeof(info->default_route) - 1] = '\0';
+        break;
     default:
         switch (code) {
         case SCE_NETCTL_INFO_GET_CNF_NAME:
@@ -633,9 +655,6 @@ EXPORT(int, sceNetCtlInetGetInfo, int code, SceNetCtlInfo *info) {
             break;
         case SCE_NETCTL_INFO_GET_PPPOE_AUTH_NAME:
             STUBBED("code SCE_NETCTL_INFO_GET_PPPOE_AUTH_NAME not implemented");
-            break;
-        case SCE_NETCTL_INFO_GET_DEFAULT_ROUTE:
-            STUBBED("code SCE_NETCTL_INFO_GET_DEFAULT_ROUTE not implemented");
             break;
         case SCE_NETCTL_INFO_GET_PRIMARY_DNS:
             STUBBED("code SCE_NETCTL_INFO_GET_PRIMARY_DNS not implemented");

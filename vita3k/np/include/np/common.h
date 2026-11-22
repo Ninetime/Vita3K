@@ -17,6 +17,13 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <string_view>
+
 #include <mem/ptr.h>
 #include <rtc/rtc.h>
 #include <util/types.h>
@@ -56,6 +63,60 @@ struct CommunicationID {
     std::uint8_t num;
     char dummy;
 };
+
+// Online ID of the signed-in user, set at sign-in
+inline std::string self_online_id;
+
+// SceNpPlatformType values, as in the PS3 sceNpUtilGetPlatformType
+enum SceNpPlatformType : uint32_t {
+    SCE_NP_PLATFORM_TYPE_NONE = 0,
+    SCE_NP_PLATFORM_TYPE_PS3 = 1,
+    SCE_NP_PLATFORM_TYPE_PSP2 = 2,
+    SCE_NP_PLATFORM_TYPE_PS4 = 3,
+};
+
+// Platforms of other users, from the NP server's user infos (RPCN UserInfo.platformType). Messages only
+// carry the sender's name, so the platform learned from rooms is reused for them.
+struct KnownPlatforms {
+    std::mutex mutex;
+    std::map<std::string, uint32_t, std::less<>> platforms;
+};
+inline KnownPlatforms known_platforms;
+
+inline void remember_platform(std::string_view online_id, uint32_t platform) {
+    if (online_id.empty() || platform == SCE_NP_PLATFORM_TYPE_NONE)
+        return;
+    std::lock_guard lock(known_platforms.mutex);
+    known_platforms.platforms[std::string(online_id)] = platform;
+}
+
+inline uint32_t get_known_platform(std::string_view online_id) {
+    if (!online_id.empty() && online_id == self_online_id)
+        return SCE_NP_PLATFORM_TYPE_PSP2;
+    std::lock_guard lock(known_platforms.mutex);
+    const auto it = known_platforms.platforms.find(online_id);
+    return it == known_platforms.platforms.end() ? SCE_NP_PLATFORM_TYPE_NONE : it->second;
+}
+
+// Platform part of SceNpId.opt, the same 4 characters as the PS3 sceNpUtilSetPlatformType writes
+inline void set_npid_platform(SceNpId &id, uint32_t platform) {
+    switch (platform) {
+    case SCE_NP_PLATFORM_TYPE_PS3: memcpy(id.opt.platformType, "ps3\0", 4); break;
+    case SCE_NP_PLATFORM_TYPE_PSP2: memcpy(id.opt.platformType, "psp2", 4); break;
+    case SCE_NP_PLATFORM_TYPE_PS4: memcpy(id.opt.platformType, "ps4\0", 4); break;
+    default: memset(id.opt.platformType, 0, 4); break;
+    }
+}
+
+// NP IDs given out by the NP servers (room members, peers, message senders) are marked valid and carry
+// the platform of the user's console, like on a real Vita: sceNpCmpNpId rejects invalid IDs, and games
+// check the platform (SFxT measures a room host's connection differently for PS3 and PS Vita hosts).
+inline void fill_server_npid(SceNpId &id, std::string_view online_id) {
+    memset(&id, 0, sizeof(id));
+    memcpy(id.handle.data, online_id.data(), std::min(online_id.size(), sizeof(id.handle.data)));
+    id.isIdValid = 1;
+    set_npid_platform(id, get_known_platform(online_id));
+}
 
 inline bool operator==(const CommunicationID &lhs, const CommunicationID &rhs) {
     return (strncmp(lhs.data, rhs.data, 9) == 0) && (lhs.num == rhs.num);

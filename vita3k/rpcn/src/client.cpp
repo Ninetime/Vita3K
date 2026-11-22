@@ -156,6 +156,7 @@ bool Client::open_connection() {
 
     sockaddr_in addr = *reinterpret_cast<sockaddr_in *>(result->ai_addr);
     addr.sin_port = htons(port);
+    server_addr = addr.sin_addr.s_addr;
     freeaddrinfo(result);
 
     const auto s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -270,7 +271,8 @@ bool Client::login() {
     }
 
     StreamWriter req;
-    req.put_string(cfg.npid).put_string(cfg.password).put_string(cfg.token);
+    // Console we emulate, so that the server can give it in our NP ID to other users
+    req.put_string(cfg.npid).put_string(cfg.password).put_string(cfg.token).put_string("psp2");
 
     const auto reply = request(CommandType::Login, req.data);
     if (!reply) {
@@ -514,7 +516,15 @@ bool Client::handle_packet(PacketType type, uint16_t command, uint64_t id, std::
     }
     case PacketType::Notification: {
         std::lock_guard lock(notif_mutex);
-        notifications.push_back({ static_cast<NotificationType>(command), std::move(data) });
+        if (static_cast<NotificationType>(command) == NotificationType::MessageReceived) {
+            // Nobody may be reading them (NP Basic not in use), keep the newest only
+            constexpr size_t MAX_QUEUED_MESSAGES = 64;
+            if (messages.size() >= MAX_QUEUED_MESSAGES)
+                messages.erase(messages.begin());
+            messages.push_back({ NotificationType::MessageReceived, std::move(data) });
+        } else {
+            notifications.push_back({ static_cast<NotificationType>(command), std::move(data) });
+        }
         return true;
     }
     case PacketType::Request:
@@ -582,6 +592,13 @@ std::vector<Notification> Client::take_notifications() {
     std::lock_guard lock(notif_mutex);
     std::vector<Notification> out;
     out.swap(notifications);
+    return out;
+}
+
+std::vector<Notification> Client::take_messages() {
+    std::lock_guard lock(notif_mutex);
+    std::vector<Notification> out;
+    out.swap(messages);
     return out;
 }
 

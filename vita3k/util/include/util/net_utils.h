@@ -36,6 +36,7 @@ struct AssignedAddr {
     std::string name; // Name of the interface
     std::string addr; // Assigned address
     std::string netMask; // Network mask
+    std::string gateway; // Default gateway of the interface, empty if unknown
 };
 std::string get_web_response(const std::string &url);
 std::string get_web_regex_result(const std::string &url, const std::regex &regex);

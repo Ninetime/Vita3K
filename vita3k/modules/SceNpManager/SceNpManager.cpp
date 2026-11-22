@@ -26,6 +26,8 @@
 
 #include <np/functions.h>
 #include <rpcn/client.h>
+#include <rpcn/p2p.h>
+#include <rpcn/vport.h>
 
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceNpManager);
@@ -68,8 +70,21 @@ static void rpcn_connect(EmuEnvState &emuenv) {
     }
 
     const rpcn::State result = emuenv.np.rpcn->connect_and_login();
-    if (result != rpcn::State::Authenticated)
+    if (result != rpcn::State::Authenticated) {
         LOG_ERROR("RPCN: unable to sign in: {}", rpcn::to_string(result));
+        return;
+    }
+
+    // Signaling/P2P port, announced to RPCN so other room members can reach us
+    np::self_online_id = emuenv.np.rpcn->npid();
+    if (!emuenv.np.p2p)
+        emuenv.np.p2p = std::make_shared<rpcn::P2P>(static_cast<uint16_t>(emuenv.cfg.rpcn_p2p_port));
+    if (emuenv.np.p2p->ok()) {
+        const auto &client = *emuenv.np.rpcn;
+        emuenv.np.p2p->set_self_npid(client.npid());
+        emuenv.np.p2p->set_rpcn(client.server_ipv4(), client.user_id(), client.local_ipv4());
+        rpcn::VportHub::get().attach(emuenv.np.p2p);
+    }
 }
 
 EXPORT(int, sceNpAuthAbortOAuthRequest) {
@@ -163,9 +178,29 @@ EXPORT(int, sceNpInit, np::CommunicationConfig *comm_config, void *dontcare) {
     return 0;
 }
 
-EXPORT(int, sceNpManagerGetAccountRegion) {
-    TRACY_FUNC(sceNpManagerGetAccountRegion);
-    return UNIMPLEMENTED();
+struct SceNpCountryCode {
+    char data[2];
+    char term;
+    char padding[1];
+};
+
+// Country of the PSN account (ISO 3166-1 alpha-2, lowercase) and its language. Games use them for region
+// filters (e.g. SFxT stores the country in a searchable room attribute).
+EXPORT(int, sceNpManagerGetAccountRegion, SceNpCountryCode *countryCode, int *languageCode) {
+    TRACY_FUNC(sceNpManagerGetAccountRegion, countryCode, languageCode);
+    if (!emuenv.np.inited)
+        return RET_ERROR(SCE_NP_ERROR_NOT_INITIALIZED);
+    if (!countryCode || !languageCode)
+        return RET_ERROR(SCE_NP_ERROR_INVALID_ARGUMENT);
+
+    std::string country = emuenv.cfg.rpcn_country;
+    if (country.size() != 2)
+        country = "us";
+    std::memset(countryCode, 0, sizeof(*countryCode));
+    countryCode->data[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(country[0])));
+    countryCode->data[1] = static_cast<char>(std::tolower(static_cast<unsigned char>(country[1])));
+    *languageCode = emuenv.cfg.sys_lang;
+    return 0;
 }
 
 EXPORT(int, sceNpManagerGetCachedParam) {

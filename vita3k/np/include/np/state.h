@@ -22,6 +22,7 @@
 
 #include <mem/util.h> // Address.
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,7 @@
 
 namespace rpcn {
 class Client;
+class P2P;
 }
 
 struct SceNpServiceStateCallback {
@@ -86,7 +88,7 @@ struct NpTusState {
     bool inited = false;
     std::mutex access_mutex;
     // Simulated handles and immediate TSS failures; no PSN authentication or storage.
-    std::unordered_map<SceUID, bool> title_contexts;
+    std::unordered_map<SceUID, std::string> title_contexts; // communication ID, "NPWR01781_00"
     std::unordered_map<SceUID, NpTusRequest> requests;
 };
 
@@ -115,5 +117,10 @@ struct NpState {
     // RPCN connection, created on first sceNpInit when RPCN is enabled. Kept across
     // sceNpTerm/sceNpInit so the server never sees a quick logout/login.
     std::shared_ptr<rpcn::Client> rpcn;
+    // UDP port for signaling and P2P sockets (same protocol as RPCS3)
+    std::shared_ptr<rpcn::P2P> p2p;
     SceNpServiceState last_reported_state = SCE_NP_SERVICE_STATE_UNKNOWN;
+    // Run when the app stops (not on sceNpTerm): resets NP module state that would otherwise outlive the app
+    // (e.g. a game relaunched without sceNpMatching2Term would get ALREADY_INITIALIZED and a dead callback thread)
+    std::vector<std::function<void()>> app_stop_hooks;
 };

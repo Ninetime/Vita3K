@@ -640,7 +640,15 @@ EXPORT(int, sceNetSocket, const char *name, int domain, SceNetSocketType type, S
         RET_NET_ERRNO(SCE_NET_ERROR_EPROTONOSUPPORT);
     bool isP2P = (type == SCE_NET_SOCK_DGRAM_P2P || type == SCE_NET_SOCK_STREAM_P2P);
 
-    SocketPtr sock = isP2P ? std::make_shared<P2PSocket>(domain, type, protocol) : std::make_shared<PosixSocket>(domain, type, protocol);
+    SocketPtr sock;
+    if (isP2P && emuenv.cfg.rpcn_enable)
+        sock = std::make_shared<RpcnP2PSocket>(type); // over the RPCN P2P port, like RPCS3
+    else if (isP2P)
+        sock = std::make_shared<P2PSocket>(domain, type, protocol);
+    else if (type == SCE_NET_SOCK_RAW && protocol == SCE_NET_IPPROTO_ICMP)
+        sock = std::make_shared<IcmpSocket>(domain, type, protocol); // pings without host raw socket privileges
+    else
+        sock = std::make_shared<PosixSocket>(domain, type, protocol);
 
     auto id = ++emuenv.net.next_id;
     emuenv.net.socks.emplace(id, sock);

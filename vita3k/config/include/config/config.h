@@ -209,6 +209,8 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(std::string, "rpcn-npid", std::string{}, rpcn_npid)                                            \
     code(std::string, "rpcn-password", std::string{}, rpcn_password)                                    \
     code(std::string, "rpcn-token", std::string{}, rpcn_token)                                          \
+    code(int, "rpcn-p2p-port", 3658, rpcn_p2p_port)                                                     \
+    code(std::string, "rpcn-country", std::string("us"), rpcn_country)                                  \
     code(int, "http-timeout-attempts", 50, http_timeout_attempts)                                       \
     code(int, "http-timeout-sleep-ms", 100, http_timeout_sleep_ms)                                      \
     code(int, "http-read-end-attempts", 10, http_read_end_attempts)                                     \
