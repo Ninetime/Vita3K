@@ -33,6 +33,7 @@
 #include <gui-qt/theme_manager.h>
 #include <io/state.h>
 #include <kernel/state.h>
+#include <np/state.h>
 #include <renderer/functions.h>
 #include <renderer/state.h>
 #include <util/log.h>
@@ -140,6 +141,7 @@ SettingsDialog::SettingsDialog(EmuEnvState &emuenv,
     apply_text_overrides();
 
     m_rpcn = new RpcnSettingsWidget(m_ui->network_scroll_contents);
+    m_rpcn->set_client_provider([env = &this->emuenv] { return env->np.rpcn; });
     m_ui->network_tab_content_layout->insertWidget(m_ui->network_tab_content_layout->indexOf(m_ui->gb_network_connection_section) + 1, m_rpcn);
 
     if (!m_app_path.empty()) {

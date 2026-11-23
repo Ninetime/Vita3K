@@ -20,7 +20,13 @@
 #include <QDialog>
 #include <QGroupBox>
 
+#include <functional>
+#include <memory>
 #include <string>
+
+namespace rpcn {
+class Client;
+}
 
 struct Config;
 class QCheckBox;
@@ -28,7 +34,10 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
+class QListWidget;
 class QSpinBox;
+class QTabWidget;
+class QTimer;
 
 // RPCN (online play server shared with RPCS3) account settings, shown in the Network settings.
 // Stores the same keys as config.yml: rpcn-enable, rpcn-host, rpcn-npid, rpcn-password (derived), rpcn-token,
@@ -41,6 +50,10 @@ public:
 
     void load(const Config &cfg);
     void save(Config &cfg) const;
+
+    // The RPCN connection of the running app, if any (the server allows one sign in per account)
+    using ClientProvider = std::function<std::shared_ptr<rpcn::Client>()>;
+    void set_client_provider(ClientProvider provider) { m_client_provider = std::move(provider); }
 
 signals:
     void changed();
@@ -58,6 +71,7 @@ private:
     void create_account();
     void resend_token();
     void reset_password();
+    void open_friends();
 
     QCheckBox *m_enable;
     QLineEdit *m_host;
@@ -70,6 +84,7 @@ private:
     QPushButton *m_create_button;
     QPushButton *m_resend_button;
     QPushButton *m_reset_button;
+    QPushButton *m_friends_button;
     QLabel *m_status;
 
     std::string m_saved_password;
@@ -77,6 +92,40 @@ private:
     mutable QString m_derived_for;
     mutable std::string m_derived;
     bool m_busy = false;
+    ClientProvider m_client_provider;
+};
+
+// Friend list management: friends with their status, friend requests received and sent, sending requests
+class RpcnFriendsDialog : public QDialog {
+    Q_OBJECT
+
+public:
+    // Uses `running` when it is signed in, else signs in with `config` while the dialog is open
+    RpcnFriendsDialog(std::shared_ptr<rpcn::Client> running, const std::string &host, const std::string &npid,
+        const std::string &password, const std::string &token, QWidget *parent = nullptr);
+    ~RpcnFriendsDialog() override;
+
+private:
+    void connected(std::shared_ptr<rpcn::Client> client, const QString &error);
+    void refresh();
+    void run_command(const QString &npid, bool add);
+    QString selected(QListWidget *list) const;
+
+    std::shared_ptr<rpcn::Client> m_client;
+    bool m_own_client = false;
+    uint64_t m_version = ~0ull;
+    QLabel *m_status;
+    QTabWidget *m_tabs;
+    QListWidget *m_friends;
+    QListWidget *m_received;
+    QListWidget *m_sent;
+    QLineEdit *m_add_name;
+    QPushButton *m_add;
+    QPushButton *m_remove;
+    QPushButton *m_accept;
+    QPushButton *m_decline;
+    QPushButton *m_cancel;
+    QTimer *m_timer;
 };
 
 // Creates an RPCN account on the given server

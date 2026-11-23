@@ -38,6 +38,7 @@ enum SceNpBasicError : uint32_t {
     SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED = 0x80551d05,
     SCE_NP_BASIC_ERROR_BUSY = 0x80551d09, // more than 20 in-game messages in 60 seconds
     SCE_NP_BASIC_ERROR_NOT_REGISTERED = 0x80551d0a, // no handler registered
+    SCE_NP_BASIC_ERROR_DATA_NOT_FOUND = 0x80551d0d, // friend list not available (yet)
 };
 
 namespace {
@@ -82,6 +83,7 @@ struct BasicState {
     Address userdata = 0;
     std::string com_id; // "NPWR01781_00"
     std::deque<std::chrono::steady_clock::time_point> sent;
+    bool friends_synced = false; // initial friend/block list events sent to the handlers
 };
 
 BasicState &basic_state() {
@@ -178,11 +180,173 @@ void deliver_messages(EmuEnvState &emuenv, SceUID thread_id, const char *export_
     }
 }
 
+// Friend list and block list event types (handler argument 1)
+enum : uint32_t {
+    LIST_EVENT_SYNC = 1, // one per entry after registration
+    LIST_EVENT_SYNC_DONE = 2,
+    LIST_EVENT_ADDED = 3,
+    LIST_EVENT_DELETED = 4,
+};
+
+// SceNpBasicFriendOnlineStatus
+enum : uint32_t {
+    FRIEND_ONLINE_STATUS_OFFLINE = 1,
+    FRIEND_ONLINE_STATUS_ONLINE_OUT_OF_CONTEXT = 3,
+    FRIEND_ONLINE_STATUS_ONLINE_IN_CONTEXT = 4,
+};
+
+// Friend context state, as np_basic derives it from the friend's presence: no title, another title, ours
+enum : uint32_t {
+    FRIEND_CONTEXT_UNKNOWN = 0,
+    FRIEND_CONTEXT_OUT_OF_CONTEXT = 1,
+    FRIEND_CONTEXT_IN_CONTEXT = 2,
+};
+
+uint32_t context_state(const rpcn::FriendInfo &info, const std::string &com_id) {
+    if (!info.online || info.presence.com_id.empty())
+        return FRIEND_CONTEXT_UNKNOWN;
+    return info.presence.com_id == com_id ? FRIEND_CONTEXT_IN_CONTEXT : FRIEND_CONTEXT_OUT_OF_CONTEXT;
+}
+
+uint32_t online_status(const rpcn::FriendInfo &info, const std::string &com_id) {
+    if (!info.online)
+        return FRIEND_ONLINE_STATUS_OFFLINE;
+    return context_state(info, com_id) == FRIEND_CONTEXT_IN_CONTEXT ? FRIEND_ONLINE_STATUS_ONLINE_IN_CONTEXT : FRIEND_ONLINE_STATUS_ONLINE_OUT_OF_CONTEXT;
+}
+
+std::optional<rpcn::FriendInfo> find_friend(const rpcn::FriendList &list, const std::string &npid) {
+    for (const auto &info : list.friends)
+        if (info.npid == npid)
+            return info;
+    return std::nullopt;
+}
+
+// Calls the friend handlers as np_basic does from sceNpBasicCheckCallback: friend list (type, npid, userdata),
+// online status (npid, status, userdata), block list (type, npid, userdata), context (npid, state, userdata).
+void deliver_friend_events(EmuEnvState &emuenv, SceUID thread_id) {
+    const auto client = emuenv.np.rpcn;
+    if (!client || !client->is_authenticated())
+        return;
+
+    auto &state = basic_state();
+    SceNpBasicEventHandlers handlers;
+    Address userdata;
+    std::string com_id;
+    bool initial_sync;
+    {
+        std::lock_guard lock(state.mutex);
+        if (!state.registered)
+            return;
+        handlers = state.handlers;
+        userdata = state.userdata;
+        com_id = state.com_id;
+        initial_sync = !state.friends_synced;
+        state.friends_synced = true;
+    }
+
+    std::vector<rpcn::FriendEvent> events = client->take_friend_events();
+    const rpcn::FriendList list = client->friend_list();
+    if (initial_sync)
+        events.clear(); // the sync below covers them
+
+    const ThreadStateRef thread = emuenv.kernel.get_thread(thread_id);
+    const Address npid_addr = alloc(emuenv.mem, sizeof(np::SceNpId), "NpBasicFriendEvent");
+    auto *npid = Ptr<np::SceNpId>(npid_addr).get(emuenv.mem);
+    const auto set_npid = [npid](const std::string &name) {
+        memset(npid, 0, sizeof(*npid));
+        if (!name.empty())
+            np::fill_server_npid(*npid, name);
+    };
+    const auto call = [&](Ptr<void> handler, uint32_t a, uint32_t b) {
+        if (handler)
+            thread->call_guest(handler.address(), { a, b, userdata });
+    };
+    const auto list_event = [&](Ptr<void> handler, uint32_t type, const std::string &name) {
+        set_npid(name);
+        call(handler, type, npid_addr);
+    };
+    const auto friend_status = [&](const rpcn::FriendInfo &info) {
+        set_npid(info.npid);
+        call(handlers.friendOnlineStatusEventHandler, npid_addr, online_status(info, com_id));
+        set_npid(info.npid);
+        call(handlers.friendContextEventHandler, npid_addr, context_state(info, com_id));
+    };
+
+    if (initial_sync) {
+        LOG_INFO("NP Basic: {} friends, {} blocked", list.friends.size(), list.blocked.size());
+        for (const auto &info : list.friends)
+            list_event(handlers.friendListEventHandler, LIST_EVENT_SYNC, info.npid);
+        list_event(handlers.friendListEventHandler, LIST_EVENT_SYNC_DONE, {});
+        for (const auto &info : list.friends)
+            friend_status(info);
+        for (const auto &name : list.blocked)
+            list_event(handlers.blockListEventHandler, LIST_EVENT_SYNC, name);
+        list_event(handlers.blockListEventHandler, LIST_EVENT_SYNC_DONE, {});
+    }
+
+    for (const auto &event : events) {
+        switch (event.type) {
+        case rpcn::NotificationType::FriendNew:
+            list_event(handlers.friendListEventHandler, LIST_EVENT_ADDED, event.npid);
+            if (const auto info = find_friend(list, event.npid))
+                friend_status(*info);
+            break;
+        case rpcn::NotificationType::FriendLost:
+            list_event(handlers.friendListEventHandler, LIST_EVENT_DELETED, event.npid);
+            break;
+        case rpcn::NotificationType::FriendStatus:
+        case rpcn::NotificationType::FriendPresenceChanged:
+            if (const auto info = find_friend(list, event.npid))
+                friend_status(*info);
+            break;
+        default:
+            break; // friend requests are handled by the system software
+        }
+    }
+    free(emuenv.mem, npid_addr);
+}
+
+// Fills `entries` from `names` starting at `start`, as the np_basic list getters do
+int get_list_entries(const std::vector<std::string> &names, SceUInt32 start, np::SceNpId *entries, SceUInt32 count, SceUInt32 *retrieved) {
+    *retrieved = 0;
+    for (SceUInt32 i = 0; i < count && start + i < names.size(); i++) {
+        memset(&entries[i], 0, sizeof(entries[i]));
+        np::fill_server_npid(entries[i], names[start + i]);
+        (*retrieved)++;
+    }
+    return 0;
+}
+
+std::vector<std::string> friend_names(const rpcn::FriendList &list) {
+    std::vector<std::string> names;
+    for (const auto &info : list.friends)
+        names.push_back(info.npid);
+    return names;
+}
+
+// Friend list of the signed in RPCN account; nullopt (DATA_NOT_FOUND) when not signed in
+std::optional<rpcn::FriendList> current_friend_list(EmuEnvState &emuenv) {
+    const auto client = emuenv.np.rpcn;
+    if (!client || !client->is_authenticated())
+        return std::nullopt;
+    return client->friend_list();
+}
+
+#define CHECK_LIST_CALL(...)                                     \
+    if (!basic_state().inited)                                   \
+        return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);    \
+    if (__VA_ARGS__)                                             \
+        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);   \
+    const auto list = current_friend_list(emuenv);               \
+    if (!list)                                                   \
+        return RET_ERROR(SCE_NP_BASIC_ERROR_DATA_NOT_FOUND);
+
 } // namespace
 
 EXPORT(int, sceNpBasicCheckCallback) {
     if (!basic_state().inited)
         return RET_ERROR(SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
+    deliver_friend_events(emuenv, thread_id);
     deliver_messages(emuenv, thread_id, export_name);
     return 0;
 }
@@ -191,41 +355,63 @@ EXPORT(int, sceNpBasicCheckIfPlayerIsBlocked) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpBasicGetBlockListEntries) {
-    return UNIMPLEMENTED();
+// The list getters take (startIndex < 100, entries, count, retrieved) and fail with DATA_NOT_FOUND
+// while the list is not available, as in the firmware
+constexpr SceUInt32 LIST_MAX_START_INDEX = 100;
+
+EXPORT(int, sceNpBasicGetBlockListEntries, SceUInt32 startIndex, np::SceNpId *entries, SceUInt32 numEntries, SceUInt32 *retrieved) {
+    CHECK_LIST_CALL(!entries || !numEntries || !retrieved || startIndex >= LIST_MAX_START_INDEX);
+    return get_list_entries(list->blocked, startIndex, entries, numEntries, retrieved);
 }
 
-EXPORT(int, sceNpBasicGetBlockListEntryCount) {
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceNpBasicGetFriendContextState) {
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceNpBasicGetFriendListEntries) {
-    return UNIMPLEMENTED();
-}
-
-EXPORT(int, sceNpBasicGetFriendListEntryCount, int *nb_friends) {
-    if (!nb_friends)
-        return RET_ERROR(SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
-
-    STUBBED("No friends");
-    *nb_friends = 0;
+EXPORT(int, sceNpBasicGetBlockListEntryCount, SceUInt32 *count) {
+    CHECK_LIST_CALL(!count);
+    *count = static_cast<SceUInt32>(list->blocked.size());
     return 0;
 }
 
-EXPORT(int, sceNpBasicGetFriendOnlineStatus) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetFriendContextState, const np::SceNpId *friendId, SceUInt32 *state) {
+    CHECK_LIST_CALL(!friendId || !state);
+    const std::string name(friendId->handle.data, strnlen(friendId->handle.data, sizeof(friendId->handle.data)));
+    const auto info = find_friend(*list, name);
+    if (!info)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_DATA_NOT_FOUND);
+    std::lock_guard lock(basic_state().mutex);
+    *state = context_state(*info, basic_state().com_id);
+    return 0;
 }
 
-EXPORT(int, sceNpBasicGetFriendRequestEntries) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetFriendListEntries, SceUInt32 startIndex, np::SceNpId *entries, SceUInt32 numEntries, SceUInt32 *retrieved) {
+    CHECK_LIST_CALL(!entries || !numEntries || !retrieved || startIndex >= LIST_MAX_START_INDEX);
+    return get_list_entries(friend_names(*list), startIndex, entries, numEntries, retrieved);
 }
 
-EXPORT(int, sceNpBasicGetFriendRequestEntryCount) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetFriendListEntryCount, SceUInt32 *count) {
+    CHECK_LIST_CALL(!count);
+    *count = static_cast<SceUInt32>(list->friends.size());
+    return 0;
+}
+
+EXPORT(int, sceNpBasicGetFriendOnlineStatus, const np::SceNpId *friendId, SceUInt32 *status) {
+    CHECK_LIST_CALL(!friendId || !status);
+    const std::string name(friendId->handle.data, strnlen(friendId->handle.data, sizeof(friendId->handle.data)));
+    const auto info = find_friend(*list, name);
+    if (!info)
+        return RET_ERROR(SCE_NP_BASIC_ERROR_DATA_NOT_FOUND);
+    std::lock_guard lock(basic_state().mutex);
+    *status = online_status(*info, basic_state().com_id);
+    return 0;
+}
+
+EXPORT(int, sceNpBasicGetFriendRequestEntries, SceUInt32 startIndex, np::SceNpId *entries, SceUInt32 numEntries, SceUInt32 *retrieved) {
+    CHECK_LIST_CALL(!entries || !numEntries || !retrieved || startIndex >= LIST_MAX_START_INDEX);
+    return get_list_entries(list->requests_received, startIndex, entries, numEntries, retrieved);
+}
+
+EXPORT(int, sceNpBasicGetFriendRequestEntryCount, SceUInt32 *count) {
+    CHECK_LIST_CALL(!count);
+    *count = static_cast<SceUInt32>(list->requests_received.size());
+    return 0;
 }
 
 EXPORT(int, sceNpBasicGetGameJoiningPresence) {
@@ -244,12 +430,15 @@ EXPORT(int, sceNpBasicGetPlaySessionLogSize) {
     return UNIMPLEMENTED();
 }
 
-EXPORT(int, sceNpBasicGetRequestedFriendRequestEntries) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetRequestedFriendRequestEntries, SceUInt32 startIndex, np::SceNpId *entries, SceUInt32 numEntries, SceUInt32 *retrieved) {
+    CHECK_LIST_CALL(!entries || !numEntries || !retrieved || startIndex >= LIST_MAX_START_INDEX);
+    return get_list_entries(list->requests_sent, startIndex, entries, numEntries, retrieved);
 }
 
-EXPORT(int, sceNpBasicGetRequestedFriendRequestEntryCount) {
-    return UNIMPLEMENTED();
+EXPORT(int, sceNpBasicGetRequestedFriendRequestEntryCount, SceUInt32 *count) {
+    CHECK_LIST_CALL(!count);
+    *count = static_cast<SceUInt32>(list->requests_sent.size());
+    return 0;
 }
 
 EXPORT(int, sceNpBasicInit, const void *option) {
@@ -267,6 +456,7 @@ EXPORT(int, sceNpBasicInit, const void *option) {
         state.userdata = 0;
         state.com_id.clear();
         state.sent.clear();
+        state.friends_synced = false;
     });
     return 0;
 }
@@ -293,6 +483,7 @@ EXPORT(int, sceNpBasicRegisterHandler, const SceNpBasicEventHandlers *handlers, 
     // Without an explicit ID the library uses the one given to sceNpInit
     state.com_id = com_id_string(commId ? *commId : emuenv.np.comm_id);
     state.registered = true;
+    state.friends_synced = false;
     LOG_INFO("NP Basic: handlers registered for {} (sdk {}, in-game message handler {})", state.com_id,
         log_hex(handlers->sdkVersion), log_hex(handlers->inGameDataMessageEventHandler.address()));
     return 0;

@@ -28,9 +28,12 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QTabWidget>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
 
@@ -123,8 +126,11 @@ RpcnSettingsWidget::RpcnSettingsWidget(QWidget *parent)
     m_create_button = new QPushButton(tr("Create Account..."), this);
     m_resend_button = new QPushButton(tr("Resend Token"), this);
     m_reset_button = new QPushButton(tr("Reset Password..."), this);
+    m_friends_button = new QPushButton(tr("Friends..."), this);
     m_resend_button->setToolTip(tr("Sends the sign in token to your email address again."));
+    m_friends_button->setToolTip(tr("See your friends, answer friend requests and send new ones."));
     buttons->addWidget(m_test_button);
+    buttons->addWidget(m_friends_button);
     buttons->addWidget(m_create_button);
     buttons->addWidget(m_resend_button);
     buttons->addWidget(m_reset_button);
@@ -149,6 +155,7 @@ RpcnSettingsWidget::RpcnSettingsWidget(QWidget *parent)
     connect(m_create_button, &QPushButton::clicked, this, &RpcnSettingsWidget::create_account);
     connect(m_resend_button, &QPushButton::clicked, this, &RpcnSettingsWidget::resend_token);
     connect(m_reset_button, &QPushButton::clicked, this, &RpcnSettingsWidget::reset_password);
+    connect(m_friends_button, &QPushButton::clicked, this, &RpcnSettingsWidget::open_friends);
 
     update_enabled();
 }
@@ -207,7 +214,7 @@ void RpcnSettingsWidget::update_enabled() {
     const bool enabled = m_enable->isChecked();
     for (QWidget *w : std::initializer_list<QWidget *>{ m_host, m_npid, m_password, m_token, m_country, m_p2p_port })
         w->setEnabled(enabled);
-    for (QWidget *w : std::initializer_list<QWidget *>{ m_test_button, m_create_button, m_resend_button, m_reset_button })
+    for (QWidget *w : std::initializer_list<QWidget *>{ m_test_button, m_create_button, m_resend_button, m_reset_button, m_friends_button })
         w->setEnabled(enabled && !m_busy);
 }
 
@@ -294,6 +301,213 @@ void RpcnSettingsWidget::reset_password() {
     m_password->setText(dialog.password());
     emit changed();
     set_status(tr("Password changed. Save the settings to use it."), false);
+}
+
+void RpcnSettingsWidget::open_friends() {
+    auto running = m_client_provider ? m_client_provider() : nullptr;
+    if (running && !running->is_authenticated())
+        running.reset();
+    if (!running && (host().empty() || npid().empty() || derived_password().empty())) {
+        set_status(tr("Enter the server, your username and your password first."), true);
+        return;
+    }
+
+    RpcnFriendsDialog dialog(running, host(), npid(), derived_password(), m_token->text().trimmed().toStdString(), this);
+    dialog.exec();
+}
+
+RpcnFriendsDialog::RpcnFriendsDialog(std::shared_ptr<rpcn::Client> running, const std::string &host, const std::string &npid,
+    const std::string &password, const std::string &token, QWidget *parent)
+    : QDialog(parent) {
+    setWindowTitle(tr("RPCN Friends"));
+    auto *layout = new QVBoxLayout(this);
+
+    m_status = new QLabel(this);
+    m_status->setWordWrap(true);
+    layout->addWidget(m_status);
+
+    m_tabs = new QTabWidget(this);
+    const auto add_tab = [this](QListWidget *&list, const QString &title, std::initializer_list<QPushButton **> buttons, std::initializer_list<QString> labels) {
+        auto *page = new QWidget(m_tabs);
+        auto *page_layout = new QVBoxLayout(page);
+        list = new QListWidget(page);
+        page_layout->addWidget(list);
+        auto *row = new QHBoxLayout();
+        row->addStretch();
+        auto label = labels.begin();
+        for (QPushButton **button : buttons) {
+            *button = new QPushButton(*label++, page);
+            row->addWidget(*button);
+        }
+        page_layout->addLayout(row);
+        m_tabs->addTab(page, title);
+    };
+    add_tab(m_friends, tr("Friends"), { &m_remove }, { tr("Remove Friend") });
+    add_tab(m_received, tr("Requests Received"), { &m_accept, &m_decline }, { tr("Accept"), tr("Decline") });
+    add_tab(m_sent, tr("Requests Sent"), { &m_cancel }, { tr("Cancel Request") });
+    layout->addWidget(m_tabs);
+
+    auto *add_row = new QHBoxLayout();
+    m_add_name = new QLineEdit(this);
+    m_add_name->setMaxLength(16);
+    m_add_name->setPlaceholderText(tr("Username"));
+    m_add = new QPushButton(tr("Send Friend Request"), this);
+    add_row->addWidget(m_add_name, 1);
+    add_row->addWidget(m_add);
+    layout->addLayout(add_row);
+
+    auto *close = new QDialogButtonBox(QDialogButtonBox::Close, this);
+    layout->addWidget(close);
+    connect(close, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+    connect(m_add, &QPushButton::clicked, this, [this] { run_command(m_add_name->text().trimmed(), true); });
+    connect(m_add_name, &QLineEdit::returnPressed, m_add, &QPushButton::click);
+    connect(m_remove, &QPushButton::clicked, this, [this] { run_command(selected(m_friends), false); });
+    connect(m_accept, &QPushButton::clicked, this, [this] { run_command(selected(m_received), true); });
+    connect(m_decline, &QPushButton::clicked, this, [this] { run_command(selected(m_received), false); });
+    connect(m_cancel, &QPushButton::clicked, this, [this] { run_command(selected(m_sent), false); });
+
+    m_timer = new QTimer(this);
+    connect(m_timer, &QTimer::timeout, this, &RpcnFriendsDialog::refresh);
+    resize(460, 420);
+
+    for (QWidget *w : std::initializer_list<QWidget *>{ m_tabs, m_add_name, m_add })
+        w->setEnabled(false);
+
+    if (running) {
+        connected(running, {});
+        return;
+    }
+
+    // Own connection while the dialog is open
+    m_own_client = true;
+    m_status->setText(tr("Signing in to %1...").arg(QString::fromStdString(host)));
+    const rpcn::Config config{ host, npid, password, token };
+    run_async(
+        this, [config]() -> std::shared_ptr<rpcn::Client> {
+            auto client = std::make_shared<rpcn::Client>(config);
+            if (client->connect_and_login() != rpcn::State::Authenticated)
+                client->disconnect();
+            return client;
+        },
+        [this](std::shared_ptr<rpcn::Client> client) {
+            if (client->is_authenticated())
+                connected(client, {});
+            else
+                connected(nullptr, QString::fromStdString(rpcn::to_string(client->state())));
+        });
+}
+
+RpcnFriendsDialog::~RpcnFriendsDialog() {
+    if (m_own_client && m_client) {
+        // Signing out waits for the server, keep it off the UI thread
+        QtConcurrent::run([client = std::move(m_client)] { client->disconnect(); });
+    }
+}
+
+void RpcnFriendsDialog::connected(std::shared_ptr<rpcn::Client> client, const QString &error) {
+    if (!client) {
+        m_status->setStyleSheet(QStringLiteral("color: #d9534f;"));
+        m_status->setText(tr("Could not sign in: %1").arg(error));
+        return;
+    }
+    m_client = std::move(client);
+    m_status->setText(tr("Signed in as %1.").arg(QString::fromStdString(m_client->npid())));
+    for (QWidget *w : std::initializer_list<QWidget *>{ m_tabs, m_add_name, m_add })
+        w->setEnabled(true);
+    refresh();
+    m_timer->start(500);
+}
+
+void RpcnFriendsDialog::refresh() {
+    if (!m_client)
+        return;
+    if (!m_client->is_authenticated()) {
+        m_timer->stop();
+        m_status->setStyleSheet(QStringLiteral("color: #d9534f;"));
+        m_status->setText(tr("Disconnected from RPCN."));
+        for (QWidget *w : std::initializer_list<QWidget *>{ m_tabs, m_add_name, m_add })
+            w->setEnabled(false);
+        return;
+    }
+    const uint64_t version = m_client->friend_list_version();
+    if (version == m_version)
+        return;
+    m_version = version;
+
+    const auto fill = [](QListWidget *list, const std::vector<std::string> &names) {
+        const QString current = list->currentItem() ? list->currentItem()->data(Qt::UserRole).toString() : QString();
+        list->clear();
+        for (const auto &name : names) {
+            auto *item = new QListWidgetItem(QString::fromStdString(name), list);
+            item->setData(Qt::UserRole, QString::fromStdString(name));
+            if (item->data(Qt::UserRole).toString() == current)
+                list->setCurrentItem(item);
+        }
+    };
+
+    const rpcn::FriendList list = m_client->friend_list();
+    std::vector<std::string> names;
+    for (const auto &info : list.friends)
+        names.push_back(info.npid);
+    fill(m_friends, names);
+    for (int i = 0; i < m_friends->count(); i++) {
+        const auto &info = list.friends[i];
+        QString text = QString::fromStdString(info.npid) + QStringLiteral(" - ") + (info.online ? tr("Online") : tr("Offline"));
+        if (info.online && !info.presence.title.empty())
+            text += QStringLiteral(" - ") + QString::fromStdString(info.presence.title);
+        m_friends->item(i)->setText(text);
+    }
+    fill(m_received, list.requests_received);
+    fill(m_sent, list.requests_sent);
+
+    m_tabs->setTabText(0, tr("Friends (%1)").arg(list.friends.size()));
+    m_tabs->setTabText(1, tr("Requests Received (%1)").arg(list.requests_received.size()));
+    m_tabs->setTabText(2, tr("Requests Sent (%1)").arg(list.requests_sent.size()));
+}
+
+QString RpcnFriendsDialog::selected(QListWidget *list) const {
+    return list->currentItem() ? list->currentItem()->data(Qt::UserRole).toString() : QString();
+}
+
+void RpcnFriendsDialog::run_command(const QString &npid, bool add) {
+    if (!m_client)
+        return;
+    const std::string name = npid.toStdString();
+    if (!rpcn::is_valid_npid(name)) {
+        m_status->setStyleSheet(QStringLiteral("color: #d9534f;"));
+        m_status->setText(npid.isEmpty() ? tr("Select or enter a username first.") : tr("%1 is not a valid username.").arg(npid));
+        return;
+    }
+    if (add && name == m_client->npid())
+        return;
+
+    m_status->setStyleSheet(QString());
+    m_status->setText(tr("Please wait..."));
+    run_async(
+        this, [client = m_client, name, add] { return add ? client->add_friend(name) : client->remove_friend(name); },
+        [this, npid, add](std::optional<rpcn::ErrorType> error) {
+            if (error == rpcn::ErrorType::NoError) {
+                m_status->setStyleSheet(QString());
+                m_status->setText(add ? tr("Done: %1 is your friend or has your request.").arg(npid) : tr("Done: %1 was removed.").arg(npid));
+                if (add)
+                    m_add_name->clear();
+                m_version = ~0ull;
+                refresh();
+                return;
+            }
+            m_status->setStyleSheet(QStringLiteral("color: #d9534f;"));
+            if (!error)
+                m_status->setText(tr("No answer from the server."));
+            else if (*error == rpcn::ErrorType::NotFound)
+                m_status->setText(tr("There is no user named %1.").arg(npid));
+            else if (*error == rpcn::ErrorType::AlreadyFriend)
+                m_status->setText(tr("%1 is already your friend, or already has your request.").arg(npid));
+            else if (*error == rpcn::ErrorType::Blocked)
+                m_status->setText(tr("%1 does not accept your requests.").arg(npid));
+            else
+                m_status->setText(tr("The request failed: %1").arg(QString::fromStdString(rpcn::to_string(*error))));
+        });
 }
 
 RpcnCreateAccountDialog::RpcnCreateAccountDialog(const std::string &host, QWidget *parent)

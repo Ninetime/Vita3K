@@ -24,7 +24,10 @@
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 
+#include <algorithm>
+#include <cstring>
 #include <future>
+#include <utility>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -306,21 +309,28 @@ bool Client::login() {
     user_avatar_url = in.get_string(false);
     user_uid = in.get<int64_t>();
 
-    std::vector<FriendInfo> friends_read;
+    std::map<std::string, FriendInfo> friends_read;
     const uint32_t num_friends = in.get<uint32_t>();
     for (uint32_t i = 0; i < num_friends && !in.is_error(); i++) {
         FriendInfo info;
         info.npid = in.get_string(false);
         info.online = in.get<uint8_t>() != 0;
-        // Presence: com id, title, status, comment, data (unused for now)
-        in.get_com_id();
-        in.get_string(true);
-        in.get_string(true);
-        in.get_string(true);
-        in.get_rawdata();
-        friends_read.push_back(std::move(info));
+        info.presence.com_id = in.get_com_id();
+        info.presence.title = in.get_string(true);
+        info.presence.status = in.get_string(true);
+        info.presence.comment = in.get_string(true);
+        info.presence.data = in.get_rawdata();
+        friends_read.insert_or_assign(info.npid, std::move(info));
     }
-    // Friend requests sent/received and blocked users follow; not needed yet
+    const auto read_names = [&in](std::set<std::string> &out) {
+        const uint32_t count = in.get<uint32_t>();
+        for (uint32_t i = 0; i < count && !in.is_error(); i++)
+            out.insert(in.get_string(false));
+    };
+    std::set<std::string> sent_read, received_read, blocked_read;
+    read_names(sent_read);
+    read_names(received_read);
+    read_names(blocked_read);
 
     if (in.is_error()) {
         LOG_ERROR("RPCN: malformed login reply");
@@ -330,8 +340,13 @@ bool Client::login() {
 
     {
         std::lock_guard lock(friends_mutex);
-        friend_list = std::move(friends_read);
+        friends = std::move(friends_read);
+        friend_requests_sent = std::move(sent_read);
+        friend_requests_received = std::move(received_read);
+        blocked_users = std::move(blocked_read);
+        friend_events.clear();
     }
+    friends_version++;
 
     current_state = State::Authenticated;
     LOG_INFO("RPCN: you are now logged in RPCN ({} | {})", cfg.npid, user_online_name);
@@ -529,6 +544,17 @@ bool Client::handle_packet(PacketType type, uint16_t command, uint64_t id, std::
         return true;
     }
     case PacketType::Notification: {
+        switch (static_cast<NotificationType>(command)) {
+        case NotificationType::FriendQuery:
+        case NotificationType::FriendNew:
+        case NotificationType::FriendLost:
+        case NotificationType::FriendStatus:
+        case NotificationType::FriendPresenceChanged:
+            handle_friend_notification(static_cast<NotificationType>(command), data);
+            return true;
+        default:
+            break;
+        }
         std::lock_guard lock(notif_mutex);
         if (static_cast<NotificationType>(command) == NotificationType::MessageReceived) {
             // Nobody may be reading them (NP Basic not in use), keep the newest only
@@ -616,9 +642,160 @@ std::vector<Notification> Client::take_messages() {
     return out;
 }
 
-std::vector<FriendInfo> Client::friends() const {
+void Client::handle_friend_notification(NotificationType type, const std::vector<uint8_t> &data) {
+    StreamReader in(data);
+    FriendEvent event{ type, {}, false };
     std::lock_guard lock(friends_mutex);
-    return friend_list;
+
+    switch (type) {
+    case NotificationType::FriendQuery: // someone sent us a friend request
+        event.npid = in.get_string(false);
+        if (in.is_error())
+            break;
+        friend_requests_received.insert(event.npid);
+        break;
+    case NotificationType::FriendNew: // a request was accepted, by us or by them
+        event.online = in.get<uint8_t>() != 0;
+        event.npid = in.get_string(false);
+        if (in.is_error())
+            break;
+        friend_requests_received.erase(event.npid);
+        friend_requests_sent.erase(event.npid);
+        friends.insert_or_assign(event.npid, FriendInfo{ event.npid, event.online, 0, {} });
+        break;
+    case NotificationType::FriendLost: // removed, by us or by them
+        event.npid = in.get_string(false);
+        if (in.is_error())
+            break;
+        friend_requests_received.erase(event.npid);
+        friend_requests_sent.erase(event.npid);
+        friends.erase(event.npid);
+        break;
+    case NotificationType::FriendStatus: {
+        event.online = in.get<uint8_t>() != 0;
+        const uint64_t timestamp = in.get<uint64_t>();
+        event.npid = in.get_string(false);
+        if (in.is_error())
+            break;
+        const auto it = friends.find(event.npid);
+        if (it == friends.end() || timestamp < it->second.timestamp)
+            return;
+        // Presence does not survive going on or offline
+        it->second = FriendInfo{ event.npid, event.online, timestamp, {} };
+        break;
+    }
+    case NotificationType::FriendPresenceChanged: {
+        event.npid = in.get_string(false);
+        FriendPresence presence;
+        presence.com_id = in.get_com_id();
+        presence.title = in.get_string(true);
+        presence.status = in.get_string(true);
+        presence.comment = in.get_string(true);
+        presence.data = in.get_rawdata();
+        if (in.is_error())
+            break;
+        const auto it = friends.find(event.npid);
+        if (it == friends.end())
+            return;
+        it->second.presence = std::move(presence);
+        event.online = it->second.online;
+        break;
+    }
+    default:
+        return;
+    }
+
+    if (in.is_error()) {
+        LOG_ERROR("RPCN: malformed friend notification {}", static_cast<int>(type));
+        return;
+    }
+    // Nobody may be reading them (NP Basic not in use), keep the newest only
+    constexpr size_t MAX_QUEUED_EVENTS = 256;
+    if (friend_events.size() >= MAX_QUEUED_EVENTS)
+        friend_events.erase(friend_events.begin());
+    friend_events.push_back(std::move(event));
+    friends_version++;
+}
+
+FriendList Client::friend_list() const {
+    std::lock_guard lock(friends_mutex);
+    FriendList list;
+    for (const auto &[npid, info] : friends)
+        list.friends.push_back(info);
+    list.requests_received.assign(friend_requests_received.begin(), friend_requests_received.end());
+    list.requests_sent.assign(friend_requests_sent.begin(), friend_requests_sent.end());
+    list.blocked.assign(blocked_users.begin(), blocked_users.end());
+    return list;
+}
+
+std::vector<FriendEvent> Client::take_friend_events() {
+    std::lock_guard lock(friends_mutex);
+    return std::exchange(friend_events, {});
+}
+
+std::optional<ErrorType> Client::simple_npid_command(CommandType command, const std::string &npid) {
+    StreamWriter req;
+    req.put_string(npid);
+    const auto reply = request(command, req.data);
+    if (!reply || reply->empty())
+        return std::nullopt;
+    const auto error = static_cast<ErrorType>((*reply)[0]);
+    if (error != ErrorType::NoError)
+        LOG_WARN("RPCN: {} {} failed: {}", to_string(command), npid, to_string(error));
+    return error;
+}
+
+std::optional<ErrorType> Client::add_friend(const std::string &npid) {
+    // The server sends FriendNew when this accepts a request; a new request gets no notification
+    const auto error = simple_npid_command(CommandType::AddFriend, npid);
+    if (error == ErrorType::NoError) {
+        std::lock_guard lock(friends_mutex);
+        if (!friends.contains(npid) && !friend_requests_received.contains(npid)) {
+            friend_requests_sent.insert(npid);
+            friends_version++;
+        }
+    }
+    return error;
+}
+
+std::optional<ErrorType> Client::remove_friend(const std::string &npid) {
+    const auto error = simple_npid_command(CommandType::RemoveFriend, npid);
+    if (error == ErrorType::NoError) {
+        std::lock_guard lock(friends_mutex);
+        // Cancelled or declined requests get no notification
+        friend_requests_sent.erase(npid);
+        friend_requests_received.erase(npid);
+        friends_version++;
+    }
+    return error;
+}
+
+void Client::set_presence(const std::string &com_id, const FriendPresence &presence) {
+    if (!is_authenticated())
+        return;
+    // SetPresenceRequest { string title = 1; string status = 2; string comment = 3; bytes data = 4; }
+    const auto field = [](std::vector<uint8_t> &out, uint8_t number, const void *data, size_t size) {
+        out.push_back(static_cast<uint8_t>((number << 3) | 2));
+        for (size_t v = size; ; v >>= 7) {
+            out.push_back(static_cast<uint8_t>((v & 0x7F) | (v >= 0x80 ? 0x80 : 0)));
+            if (v < 0x80)
+                break;
+        }
+        const auto *bytes = static_cast<const uint8_t *>(data);
+        out.insert(out.end(), bytes, bytes + size);
+    };
+    std::vector<uint8_t> msg;
+    field(msg, 1, presence.title.data(), presence.title.size());
+    field(msg, 2, presence.status.data(), presence.status.size());
+    field(msg, 3, presence.comment.data(), presence.comment.size());
+    field(msg, 4, presence.data.data(), presence.data.size());
+
+    std::vector<uint8_t> payload(COMMUNICATION_ID_SIZE, 0);
+    std::memcpy(payload.data(), com_id.data(), std::min(com_id.size(), COMMUNICATION_ID_SIZE));
+    const uint32_t size = static_cast<uint32_t>(msg.size());
+    payload.insert(payload.end(), reinterpret_cast<const uint8_t *>(&size), reinterpret_cast<const uint8_t *>(&size) + 4);
+    payload.insert(payload.end(), msg.begin(), msg.end());
+    queue_packet(CommandType::SetPresence, payload, nullptr);
 }
 
 std::optional<std::vector<uint16_t>> Client::get_server_list(const std::string &com_id) {

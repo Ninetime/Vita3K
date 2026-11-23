@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,9 +55,34 @@ struct Notification {
     std::vector<uint8_t> data;
 };
 
+// What a friend is doing, as set with SetPresence (sceNpBasicSetInGamePresence...)
+struct FriendPresence {
+    std::string com_id; // "NPWR01781_00", empty when not in a game using NP
+    std::string title;
+    std::string status;
+    std::string comment;
+    std::vector<uint8_t> data;
+};
+
 struct FriendInfo {
     std::string npid;
     bool online = false;
+    uint64_t timestamp = 0; // of the last online status change
+    FriendPresence presence;
+};
+
+struct FriendList {
+    std::vector<FriendInfo> friends; // sorted by NP ID
+    std::vector<std::string> requests_received; // friend requests waiting for our answer
+    std::vector<std::string> requests_sent;
+    std::vector<std::string> blocked;
+};
+
+// Change in the friend list, as told by the server (FriendQuery ... FriendPresenceChanged notifications)
+struct FriendEvent {
+    NotificationType type;
+    std::string npid;
+    bool online = false; // FriendNew / FriendStatus
 };
 
 // Reply payload, starting with the ErrorType byte. Empty if the connection dropped.
@@ -102,7 +128,19 @@ public:
     const std::string &online_name() const { return user_online_name; }
     const std::string &avatar_url() const { return user_avatar_url; }
     int64_t user_id() const { return user_uid; }
-    std::vector<FriendInfo> friends() const;
+    FriendList friend_list() const;
+    // Increases whenever the friend list changes
+    uint64_t friend_list_version() const { return friends_version.load(); }
+    // Drains friend list changes received so far (kept apart from take_notifications())
+    std::vector<FriendEvent> take_friend_events();
+
+    // Friend list management. Adding someone who sent us a request accepts it; removing someone we sent a
+    // request to, or who sent us one, cancels or declines it. Blocking. Returns nullopt without an answer.
+    // (The server does not implement blocking users yet: AddBlock/RemoveBlock succeed without effect.)
+    std::optional<ErrorType> add_friend(const std::string &npid);
+    std::optional<ErrorType> remove_friend(const std::string &npid);
+    // Tells friends what we are doing (fire and forget)
+    void set_presence(const std::string &com_id, const FriendPresence &presence);
     uint32_t local_ipv4() const { return local_addr.load(); } // network byte order
     uint32_t server_ipv4() const { return server_addr.load(); } // network byte order
 
@@ -118,6 +156,8 @@ private:
     void network_thread_main();
     bool pump_io();
     bool handle_packet(PacketType type, uint16_t command, uint64_t id, std::vector<uint8_t> data);
+    void handle_friend_notification(NotificationType type, const std::vector<uint8_t> &data);
+    std::optional<ErrorType> simple_npid_command(CommandType command, const std::string &npid);
     uint64_t queue_packet(CommandType command, const std::vector<uint8_t> &payload, ReplyCallback callback);
     void fail_pending();
 
@@ -159,7 +199,12 @@ private:
     std::string user_avatar_url;
     int64_t user_uid = 0;
     mutable std::mutex friends_mutex;
-    std::vector<FriendInfo> friend_list;
+    std::map<std::string, FriendInfo> friends;
+    std::set<std::string> friend_requests_received;
+    std::set<std::string> friend_requests_sent;
+    std::set<std::string> blocked_users;
+    std::vector<FriendEvent> friend_events;
+    std::atomic<uint64_t> friends_version{ 0 };
 };
 
 } // namespace rpcn
