@@ -427,7 +427,9 @@ bool Client::pump_io() {
         }
     }
 
-    // Read side
+    // Read side. The server may close the connection right after a reply (it does after account creation),
+    // so packets read before the close are still handled.
+    bool closed = false;
     uint8_t tmp[16384];
     while (true) {
         const int ret = SSL_read(s, tmp, sizeof(tmp));
@@ -439,7 +441,8 @@ bool Client::pump_io() {
                 LOG_INFO("RPCN: server closed the connection");
             else
                 LOG_ERROR("RPCN: read failed: {}", openssl_error());
-            return false;
+            closed = true;
+            break;
         }
         progress = true;
         recv_buf.insert(recv_buf.end(), tmp, tmp + ret);
@@ -470,6 +473,9 @@ bool Client::pump_io() {
     }
     if (offset)
         recv_buf.erase(recv_buf.begin(), recv_buf.begin() + offset);
+
+    if (closed)
+        return false;
 
     if (progress || SSL_pending(s) > 0)
         return true;

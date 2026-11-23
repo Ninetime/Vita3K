@@ -20,6 +20,8 @@
 #include <kernel/state.h>
 
 #include <net/state.h>
+#include <np/state.h>
+#include <rpcn/p2p.h>
 
 #include <util/lock_and_find.h>
 #include <util/net_utils.h>
@@ -641,7 +643,10 @@ EXPORT(int, sceNetSocket, const char *name, int domain, SceNetSocketType type, S
     bool isP2P = (type == SCE_NET_SOCK_DGRAM_P2P || type == SCE_NET_SOCK_STREAM_P2P);
 
     SocketPtr sock;
-    if (isP2P && emuenv.cfg.rpcn_enable)
+    // P2P sockets carry both online (NP) and ad hoc traffic. They go over RPCN once the app has signed in to it,
+    // unless the ad hoc network is in use: on a Vita both cannot be active at once.
+    const bool adhoc_mode = emuenv.netctl.adhocState != SCE_NET_CTL_STATE_DISCONNECTED;
+    if (isP2P && emuenv.np.p2p && emuenv.np.p2p->ok() && !adhoc_mode)
         sock = std::make_shared<RpcnP2PSocket>(type); // over the RPCN P2P port, like RPCS3
     else if (isP2P)
         sock = std::make_shared<P2PSocket>(domain, type, protocol);
