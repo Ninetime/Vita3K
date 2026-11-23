@@ -40,6 +40,12 @@ bool deinit(NpState &state) {
         state.tus_state.requests.clear();
         state.tus_state.inited = false;
     }
+    {
+        std::lock_guard lock(state.score_state.access_mutex);
+        state.score_state.title_contexts.clear();
+        state.score_state.requests.clear();
+        state.score_state.inited = false;
+    }
     state.cbs.clear();
     state.state_cb_id = 0;
     state.comm_id = {};

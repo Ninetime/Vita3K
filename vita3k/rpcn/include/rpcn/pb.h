@@ -140,6 +140,14 @@ public:
         return out;
     }
 
+    std::vector<std::string> strings(uint32_t field) const {
+        std::vector<std::string> out;
+        for (const auto &f : fields)
+            if (f.number == field && f.type == LengthDelimited)
+                out.emplace_back(reinterpret_cast<const char *>(f.data), f.size);
+        return out;
+    }
+
     // Repeated scalar, packed or not
     std::vector<uint64_t> repeated_u64(uint32_t field) const {
         std::vector<uint64_t> out;

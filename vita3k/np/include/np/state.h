@@ -111,6 +111,7 @@ struct NpState {
 
     NpTrophyState trophy_state;
     NpTusState tus_state;
+    NpTusState score_state; // same handles as TUS: title contexts (communication ID) and requests
     NpAuthState auth_state;
     np::CommunicationID comm_id;
 
